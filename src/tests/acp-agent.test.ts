@@ -36,9 +36,11 @@ import {
   describeAlwaysAllow,
   streamEventToAcpNotifications,
   messageIdForGrouping,
+  computeFollowupUsageUpdate,
   type SDKMessageFilter,
 } from "../acp-agent.js";
 import { Pushable } from "../utils.js";
+import { TurnQueue, OffTurnFollowupCollector } from "../session-reader.js";
 import {
   deleteSession,
   getSessionMessages,
@@ -46,6 +48,25 @@ import {
   SDKAssistantMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import { randomUUID } from "crypto";
+
+/** Test helper: arrange the per-session reader for an inline-injected
+ *  Session so prompt() has a producer feeding its turnQueue. Mirrors what
+ *  createSession() does in production. */
+function startReaderForTest(agent: ClaudeAcpAgent, sessionId: string): void {
+  const session = agent.sessions[sessionId];
+  if (!session) throw new Error(`startReaderForTest: session ${sessionId} not found`);
+  let resolveDone!: () => void;
+  session.readerDone = new Promise<void>((r) => {
+    resolveDone = r;
+  });
+  void (
+    agent as unknown as {
+      startSessionReaderForTest(id: string, done: () => void): Promise<void>;
+    }
+  )
+    .startSessionReaderForTest(sessionId, resolveDone)
+    .catch(() => resolveDone());
+}
 
 vi.mock("@anthropic-ai/claude-agent-sdk", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@anthropic-ai/claude-agent-sdk")>();
@@ -1708,7 +1729,15 @@ describe("stop reason propagation", () => {
       taskState: new Map(),
       toolUseCache: {},
       messageIdToUuid: new Map(),
+      turnQueue: new TurnQueue(),
+      offTurn: new OffTurnFollowupCollector("test-session", async () => {}, {
+        log: () => {},
+        error: () => {},
+      }),
+      readerDone: Promise.resolve(),
+      readerSideEffects: Promise.resolve(),
     };
+    startReaderForTest(agent, "test-session");
   }
 
   it("should return max_tokens when success result has stop_reason max_tokens", async () => {
@@ -1854,7 +1883,15 @@ describe("stop reason propagation", () => {
       taskState: new Map(),
       toolUseCache: {},
       messageIdToUuid: new Map(),
+      turnQueue: new TurnQueue(),
+      offTurn: new OffTurnFollowupCollector("test-session", async () => {}, {
+        log: () => {},
+        error: () => {},
+      }),
+      readerDone: Promise.resolve(),
+      readerSideEffects: Promise.resolve(),
     };
+    startReaderForTest(agent, "test-session");
 
     const response = await agent.prompt({
       sessionId: "test-session",
@@ -2015,7 +2052,15 @@ describe("session/close", () => {
       taskState: new Map(),
       toolUseCache: {},
       messageIdToUuid: new Map(),
+      turnQueue: new TurnQueue(),
+      offTurn: new OffTurnFollowupCollector("test-session", async () => {}, {
+        log: () => {},
+        error: () => {},
+      }),
+      readerDone: Promise.resolve(),
+      readerSideEffects: Promise.resolve(),
     };
+    startReaderForTest(agent, sessionId);
     return agent.sessions[sessionId]!;
   }
 
@@ -2101,7 +2146,15 @@ describe("session/delete", () => {
       taskState: new Map(),
       toolUseCache: {},
       messageIdToUuid: new Map(),
+      turnQueue: new TurnQueue(),
+      offTurn: new OffTurnFollowupCollector("test-session", async () => {}, {
+        log: () => {},
+        error: () => {},
+      }),
+      readerDone: Promise.resolve(),
+      readerSideEffects: Promise.resolve(),
     };
+    startReaderForTest(agent, sessionId);
     return agent.sessions[sessionId]!;
   }
 
@@ -2204,7 +2257,15 @@ describe("getOrCreateSession param change detection", () => {
       taskState: new Map(),
       toolUseCache: {},
       messageIdToUuid: new Map(),
+      turnQueue: new TurnQueue(),
+      offTurn: new OffTurnFollowupCollector("test-session", async () => {}, {
+        log: () => {},
+        error: () => {},
+      }),
+      readerDone: Promise.resolve(),
+      readerSideEffects: Promise.resolve(),
     };
+    startReaderForTest(agent, sessionId);
     return agent.sessions[sessionId]!;
   }
 
@@ -2391,6 +2452,137 @@ describe("usage_update computation", () => {
     return { agent, updates };
   }
 
+  it("computes followup usage from buffered stream snapshots", () => {
+    const result = createResultMessageWithModel({
+      modelUsage: {
+        "claude-opus-4-20250514": {
+          inputTokens: 1000,
+          outputTokens: 500,
+          cacheReadInputTokens: 200,
+          cacheCreationInputTokens: 100,
+          webSearchRequests: 0,
+          costUSD: 0.01,
+          contextWindow: 1000000,
+          maxOutputTokens: 16384,
+        },
+      },
+    });
+    result.usage = {
+      input_tokens: 1,
+      output_tokens: 1,
+      cache_read_input_tokens: 0,
+      cache_creation_input_tokens: 0,
+    };
+
+    const update = computeFollowupUsageUpdate(
+      [
+        createStreamEvent("message_start", {
+          model: "claude-opus-4-20250514",
+          usage: {
+            input_tokens: 1000,
+            output_tokens: 0,
+            cache_read_input_tokens: 200,
+            cache_creation_input_tokens: 100,
+          },
+        }) as any,
+        createStreamEvent("message_delta", {
+          usage: { output_tokens: 500 },
+        }) as any,
+      ],
+      result as any,
+      200000,
+    );
+
+    expect(update).toEqual({ used: 1800, size: 1000000 });
+  });
+
+  it("falls back to result usage for followups without a buffered usage snapshot", () => {
+    const result = createResultMessageWithModel({ modelUsage: {} });
+    result.usage = {
+      input_tokens: 10,
+      output_tokens: 5,
+      cache_read_input_tokens: 2,
+      cache_creation_input_tokens: 1,
+    };
+
+    expect(computeFollowupUsageUpdate([], result as any, 200000)).toEqual({
+      used: 18,
+      size: 200000,
+    });
+  });
+
+  it("ignores subagent (non-top-level) messages and falls back to result usage", () => {
+    const result = createResultMessageWithModel({ modelUsage: {} });
+    result.usage = {
+      input_tokens: 30,
+      output_tokens: 7,
+      cache_read_input_tokens: 0,
+      cache_creation_input_tokens: 0,
+    };
+
+    // Every buffered message belongs to a subagent (parent_tool_use_id set),
+    // so no top-level snapshot is captured and `used` falls back to
+    // result.usage rather than counting subagent token spend.
+    const update = computeFollowupUsageUpdate(
+      [
+        createStreamEvent(
+          "message_start",
+          {
+            model: "claude-opus-4-20250514",
+            usage: {
+              input_tokens: 99999,
+              output_tokens: 0,
+              cache_read_input_tokens: 0,
+              cache_creation_input_tokens: 0,
+            },
+          },
+          "subagent-tool-1",
+        ) as any,
+        createStreamEvent(
+          "message_delta",
+          { usage: { output_tokens: 88888 } },
+          "subagent-tool-1",
+        ) as any,
+      ],
+      result as any,
+      200000,
+    );
+
+    expect(update).toEqual({ used: 37, size: 200000 });
+  });
+
+  it("infers context window size when the model has no matching modelUsage key", () => {
+    // modelUsage doesn't contain the buffered model, so size resolution skips
+    // getMatchingModelUsage and uses inferContextWindowFromModel: a '[1m]'
+    // model infers 1,000,000 rather than the fallback.
+    const result = createResultMessageWithModel({ modelUsage: {} });
+    result.usage = {
+      input_tokens: 1,
+      output_tokens: 1,
+      cache_read_input_tokens: 0,
+      cache_creation_input_tokens: 0,
+    };
+
+    const update = computeFollowupUsageUpdate(
+      [
+        createStreamEvent("message_start", {
+          model: "claude-sonnet-4-6[1m]",
+          usage: {
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+          },
+        }) as any,
+      ],
+      result as any,
+      200000,
+    );
+
+    expect(update.used).toBe(150);
+    expect(update.size).toBe(1000000);
+  });
+
   function injectSession(agent: ClaudeAcpAgent, messages: any[]) {
     const input = new Pushable<any>();
     async function* messageGenerator() {
@@ -2441,7 +2633,15 @@ describe("usage_update computation", () => {
       taskState: new Map(),
       toolUseCache: {},
       messageIdToUuid: new Map(),
+      turnQueue: new TurnQueue(),
+      offTurn: new OffTurnFollowupCollector("test-session", async () => {}, {
+        log: () => {},
+        error: () => {},
+      }),
+      readerDone: Promise.resolve(),
+      readerSideEffects: Promise.resolve(),
     };
+    startReaderForTest(agent, "test-session");
   }
 
   it("used sums all token types as post-turn context occupancy proxy", async () => {
@@ -3450,7 +3650,15 @@ describe("assembled assistant text fallback", () => {
       taskState: new Map(),
       toolUseCache: {},
       messageIdToUuid: new Map(),
+      turnQueue: new TurnQueue(),
+      offTurn: new OffTurnFollowupCollector("test-session", async () => {}, {
+        log: () => {},
+        error: () => {},
+      }),
+      readerDone: Promise.resolve(),
+      readerSideEffects: Promise.resolve(),
     };
+    startReaderForTest(agent, "test-session");
   }
 
   function messageChunkTexts(updates: any[]): string[] {
@@ -3646,7 +3854,15 @@ describe("emitRawSDKMessages", () => {
       taskState: new Map(),
       toolUseCache: {},
       messageIdToUuid: new Map(),
+      turnQueue: new TurnQueue(),
+      offTurn: new OffTurnFollowupCollector("test-session", async () => {}, {
+        log: () => {},
+        error: () => {},
+      }),
+      readerDone: Promise.resolve(),
+      readerSideEffects: Promise.resolve(),
     };
+    startReaderForTest(agent, "test-session");
   }
 
   function createResultMessage() {
@@ -3876,7 +4092,15 @@ describe("result origin handling", () => {
       taskState: new Map(),
       toolUseCache: {},
       messageIdToUuid: new Map(),
+      turnQueue: new TurnQueue(),
+      offTurn: new OffTurnFollowupCollector("test-session", async () => {}, {
+        log: () => {},
+        error: () => {},
+      }),
+      readerDone: Promise.resolve(),
+      readerSideEffects: Promise.resolve(),
     };
+    startReaderForTest(agent, "test-session");
   }
 
   function createAssistantMessage() {
@@ -4053,7 +4277,15 @@ describe("memory_recall handling", () => {
       taskState: new Map(),
       toolUseCache: {},
       messageIdToUuid: new Map(),
+      turnQueue: new TurnQueue(),
+      offTurn: new OffTurnFollowupCollector("test-session", async () => {}, {
+        log: () => {},
+        error: () => {},
+      }),
+      readerDone: Promise.resolve(),
+      readerSideEffects: Promise.resolve(),
     };
+    startReaderForTest(agent, "test-session");
   }
 
   function createResult() {
@@ -4285,7 +4517,15 @@ describe("post-error recovery", () => {
       taskState: new Map(),
       toolUseCache: {},
       messageIdToUuid: new Map(),
+      turnQueue: new TurnQueue(),
+      offTurn: new OffTurnFollowupCollector("test-session", async () => {}, {
+        log: () => {},
+        error: () => {},
+      }),
+      readerDone: Promise.resolve(),
+      readerSideEffects: Promise.resolve(),
     };
+    startReaderForTest(agent, "test-session");
     return { interrupt };
   }
 
@@ -4432,7 +4672,15 @@ describe("session/cancel wedge recovery (issue #680)", () => {
       taskState: new Map(),
       toolUseCache: {},
       messageIdToUuid: new Map(),
+      turnQueue: new TurnQueue(),
+      offTurn: new OffTurnFollowupCollector("test-session", async () => {}, {
+        log: () => {},
+        error: () => {},
+      }),
+      readerDone: Promise.resolve(),
+      readerSideEffects: Promise.resolve(),
     };
+    startReaderForTest(agent, "test-session");
     return { interrupt };
   }
 
@@ -4732,5 +4980,1827 @@ describe("messageIdForGrouping", () => {
   it("returns undefined when there is no usable id", () => {
     expect(messageIdForGrouping({ type: "system", message: {} })).toBeUndefined();
     expect(messageIdForGrouping({ type: "assistant", uuid: "", message: {} })).toBeUndefined();
+  });
+});
+
+describe("session reader (issue #336)", () => {
+  // Single-consumer producer of SDK messages for the per-session reader.
+  // Tracks concurrent calls to assert the single-consumer invariant.
+  class QueryStub {
+    private queue: any[] = [];
+    private waiter: ((r: IteratorResult<any, void>) => void) | null = null;
+    private rejecter: ((err: unknown) => void) | null = null;
+    private closed = false;
+    private throwOnNextErr: unknown = undefined;
+    /** Highest number of `next()` calls that were simultaneously in flight. */
+    public maxConcurrentReads = 0;
+    private inFlight = 0;
+    /** Counts every `next()` invocation, including those that resolved
+     *  synchronously from the buffer. */
+    public nextCallCount = 0;
+
+    /** True when the producer queue is empty and the reader is parked on
+     *  next(). Tests use this to know the reader has caught up to the
+     *  most recent push before asserting reader-driven state. */
+    isIdle(): boolean {
+      return this.queue.length === 0 && this.waiter !== null;
+    }
+
+    push(item: any): void {
+      if (this.waiter) {
+        const w = this.waiter;
+        this.waiter = null;
+        this.rejecter = null;
+        w({ value: item, done: false });
+      } else {
+        this.queue.push(item);
+      }
+    }
+    close(): void {
+      this.closed = true;
+      if (this.waiter) {
+        const w = this.waiter;
+        this.waiter = null;
+        this.rejecter = null;
+        w({ value: undefined as any, done: true });
+      }
+    }
+    throwOnNext(err: unknown): void {
+      this.throwOnNextErr = err;
+      if (this.rejecter) {
+        const r = this.rejecter;
+        this.waiter = null;
+        this.rejecter = null;
+        r(err);
+      }
+    }
+    next(): Promise<IteratorResult<any, void>> {
+      this.nextCallCount++;
+      this.inFlight++;
+      if (this.inFlight > this.maxConcurrentReads) {
+        this.maxConcurrentReads = this.inFlight;
+      }
+      const finish = <T>(v: T): T => {
+        this.inFlight--;
+        return v;
+      };
+      if (this.throwOnNextErr !== undefined) {
+        const err = this.throwOnNextErr;
+        this.throwOnNextErr = undefined;
+        this.inFlight--;
+        return Promise.reject(err);
+      }
+      if (this.queue.length > 0) {
+        const value = this.queue.shift()!;
+        this.inFlight--;
+        return Promise.resolve({ value, done: false });
+      }
+      if (this.closed) {
+        this.inFlight--;
+        return Promise.resolve({ value: undefined as any, done: true });
+      }
+      return new Promise<IteratorResult<any, void>>((resolve, reject) => {
+        this.waiter = (r) => {
+          finish(undefined);
+          resolve(r);
+        };
+        this.rejecter = (e) => {
+          finish(undefined);
+          reject(e);
+        };
+      });
+    }
+    // The session reader doesn't call these but production paths might.
+    interrupt(): Promise<void> {
+      return Promise.resolve();
+    }
+    closeQuery(): void {
+      this.closed = true;
+    }
+  }
+
+  function createCaptureClient() {
+    const sessionUpdates: Array<{ sessionId: string; update: any }> = [];
+    const extNotifications: Array<{ method: string; params: any }> = [];
+    const client = {
+      sessionUpdate: vi.fn(async (n: any) => {
+        sessionUpdates.push(n);
+      }),
+      extNotification: vi.fn(async (method: string, params: any) => {
+        extNotifications.push({ method, params });
+      }),
+    } as unknown as AgentSideConnection;
+    return { client, sessionUpdates, extNotifications };
+  }
+
+  function buildSession(
+    sessionId: string,
+    agent: ClaudeAcpAgent,
+    query: QueryStub,
+    input: Pushable<any>,
+    opts: { emitRawSDKMessages?: boolean; useRealFollowup?: boolean } = {},
+  ) {
+    // Default emitter is a no-op; tests that exercise followup forwarding
+    // replace `session.offTurn` with a collector bound to a capturing
+    // emitter (see the followup-forwarding tests below). With
+    // useRealFollowup the collector is bound to the production #emitFollowup
+    // so the end-to-end render path is exercised.
+    const emitter = opts.useRealFollowup
+      ? (msgs: any[], result: any) =>
+          (
+            agent as unknown as {
+              emitFollowupForTest(id: string, m: any[], r: any): Promise<void>;
+            }
+          ).emitFollowupForTest(sessionId, msgs, result)
+      : async () => {};
+    const offTurn = new OffTurnFollowupCollector(sessionId, emitter, {
+      log: () => {},
+      error: () => {},
+    });
+    const session = {
+      query: query as any,
+      input,
+      cancelled: false,
+      cwd: "/test",
+      sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
+      settingsManager: { dispose: vi.fn() } as any,
+      accumulatedUsage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        cachedReadTokens: 0,
+        cachedWriteTokens: 0,
+      },
+      modes: { currentModeId: "default", availableModes: [] },
+      models: { currentModelId: "default", availableModels: [] },
+      modelInfos: [],
+      configOptions: [],
+      promptRunning: false,
+      pendingMessages: new Map(),
+      nextPendingOrder: 0,
+      abortController: new AbortController(),
+      emitRawSDKMessages: opts.emitRawSDKMessages ?? false,
+      contextWindowSize: 200000,
+      taskState: new Map(),
+      toolUseCache: {},
+      messageIdToUuid: new Map(),
+      turnQueue: new TurnQueue(),
+      offTurn,
+      readerDone: Promise.resolve(),
+      readerSideEffects: Promise.resolve(),
+    };
+    agent.sessions[sessionId] = session as any;
+    startReaderForTest(agent, sessionId);
+    return session;
+  }
+
+  function createAgent(client: AgentSideConnection) {
+    return new ClaudeAcpAgent(client, { log: () => {}, error: () => {} });
+  }
+
+  it("forwards task_started using description (not summary) for the label", async () => {
+    const { client, sessionUpdates } = createCaptureClient();
+    const agent = createAgent(client);
+    const query = new QueryStub();
+    const input = new Pushable<any>();
+    buildSession("s1", agent, query, input);
+
+    query.push({
+      type: "system",
+      subtype: "task_started",
+      task_id: "t1",
+      description: "ship the docs",
+      uuid: "u",
+      session_id: "s1",
+    });
+
+    await vi.waitFor(() => expect(sessionUpdates.length).toBe(1));
+    expect(sessionUpdates[0].update.sessionUpdate).toBe("agent_message_chunk");
+    // Wrapped in blank lines so back-to-back lifecycle chunks and following
+    // agent text don't fuse into one markdown paragraph.
+    expect(sessionUpdates[0].update.content.text).toBe("\n\n[task t1] started: ship the docs\n\n");
+
+    agent.sessions["s1"]!.abortController.abort();
+    query.close();
+  });
+
+  it("forwards task_notification with the SDK status (no fallback to 'completed')", async () => {
+    const { client, sessionUpdates } = createCaptureClient();
+    const agent = createAgent(client);
+    const query = new QueryStub();
+    const input = new Pushable<any>();
+    buildSession("s1", agent, query, input);
+
+    query.push({
+      type: "system",
+      subtype: "task_notification",
+      task_id: "t9",
+      status: "failed",
+      summary: "build broke",
+      output_file: "/tmp/9",
+      uuid: "u",
+      session_id: "s1",
+    });
+
+    await vi.waitFor(() => expect(sessionUpdates.length).toBe(1));
+    expect(sessionUpdates[0].update.content.text).toContain("[task t9] failed: build broke");
+    expect(sessionUpdates[0].update.content.text).toContain("output: /tmp/9");
+
+    agent.sessions["s1"]!.abortController.abort();
+    query.close();
+  });
+
+  it("wraps lifecycle chunks in blank lines so back-to-back tasks stay separated", async () => {
+    const { client, sessionUpdates } = createCaptureClient();
+    const agent = createAgent(client);
+    const query = new QueryStub();
+    const input = new Pushable<any>();
+    buildSession("s1", agent, query, input);
+
+    // Two notifications landing back-to-back (e.g. two background tasks
+    // finishing together) are the case that regressed: clients concatenate
+    // chunk text raw, so without blank-line wrapping they fuse into one line.
+    query.push({
+      type: "system",
+      subtype: "task_notification",
+      task_id: "t1",
+      status: "completed",
+      summary: "first",
+      uuid: "u1",
+      session_id: "s1",
+    });
+    query.push({
+      type: "system",
+      subtype: "task_notification",
+      task_id: "t2",
+      status: "completed",
+      summary: "second",
+      uuid: "u2",
+      session_id: "s1",
+    });
+
+    await vi.waitFor(() => expect(sessionUpdates.length).toBe(2));
+    // Each chunk is wrapped, so concatenating them yields a blank-line
+    // (paragraph) separator between the two tasks rather than a fused run.
+    const concatenated = sessionUpdates.map((u) => u.update.content.text).join("");
+    expect(concatenated).toContain("[task t1] completed: first\n\n");
+    expect(concatenated).toContain("\n\n[task t2] completed: second");
+    expect(concatenated).not.toContain("first[task t2]");
+
+    agent.sessions["s1"]!.abortController.abort();
+    query.close();
+  });
+
+  it("suppresses lifecycle forward when skip_transcript=true", async () => {
+    const { client, sessionUpdates } = createCaptureClient();
+    const agent = createAgent(client);
+    const query = new QueryStub();
+    const input = new Pushable<any>();
+    buildSession("s1", agent, query, input);
+
+    query.push({
+      type: "system",
+      subtype: "task_notification",
+      task_id: "t2",
+      status: "completed",
+      summary: "",
+      output_file: "",
+      skip_transcript: true,
+      uuid: "u",
+      session_id: "s1",
+    });
+    // Use a no-op message after the suppressed one to give the reader
+    // something to ack before we assert.
+    query.push({
+      type: "system",
+      subtype: "task_started",
+      task_id: "t3",
+      description: "follow-up",
+      uuid: "u2",
+      session_id: "s1",
+    });
+
+    await vi.waitFor(() => expect(sessionUpdates.length).toBe(1));
+    expect(sessionUpdates[0].update.content.text).toContain("[task t3] started");
+
+    agent.sessions["s1"]!.abortController.abort();
+    query.close();
+  });
+
+  it("emits raw SDK messages uniformly for both in-turn and off-turn", async () => {
+    const { client, extNotifications } = createCaptureClient();
+    const agent = createAgent(client);
+    const query = new QueryStub();
+    const input = new Pushable<any>();
+    buildSession("s1", agent, query, input, { emitRawSDKMessages: true });
+
+    // Off-turn lifecycle: reader should raw-emit.
+    query.push({
+      type: "system",
+      subtype: "task_started",
+      task_id: "t1",
+      description: "off-turn",
+      uuid: "u",
+      session_id: "s1",
+    });
+
+    await vi.waitFor(() => expect(extNotifications.length).toBe(1));
+    expect(extNotifications[0].method).toBe("_claude/sdkMessage");
+    expect(extNotifications[0].params.sessionId).toBe("s1");
+
+    agent.sessions["s1"]!.abortController.abort();
+    query.close();
+  });
+
+  it("does not double-emit raw SDK messages for in-turn traffic", async () => {
+    // The reader is the only raw-emit site; prompt() no longer raw-emits.
+    // Verify that each in-turn message produces exactly one
+    // `_claude/sdkMessage` notification.
+    const { client, extNotifications } = createCaptureClient();
+    const agent = createAgent(client);
+    const query = new QueryStub();
+    const input = new Pushable<any>();
+    const session = buildSession("s1", agent, query, input, { emitRawSDKMessages: true });
+
+    const promptDone = agent.prompt({
+      sessionId: "s1",
+      prompt: [{ type: "text", text: "hi" }],
+    });
+
+    // Replay + result + idle: three in-turn messages.
+    query.push({
+      type: "user",
+      message: { role: "user", content: "hi" },
+      parent_tool_use_id: null,
+      isReplay: true,
+      uuid: "ur",
+      session_id: "s1",
+    });
+    query.push({
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      result: "ok",
+      stop_reason: "end_turn",
+      num_turns: 1,
+      duration_ms: 1,
+      duration_api_ms: 1,
+      total_cost_usd: 0,
+      usage: {
+        input_tokens: 1,
+        output_tokens: 1,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+      },
+      modelUsage: {},
+      permission_denials: [],
+      uuid: "ures",
+      session_id: "s1",
+    });
+    query.push({
+      type: "system",
+      subtype: "session_state_changed",
+      state: "idle",
+    });
+
+    await promptDone;
+    await session.readerSideEffects;
+    // Three messages → exactly three raw-emit notifications, not six.
+    expect(extNotifications.length).toBe(3);
+    for (const n of extNotifications) {
+      expect(n.method).toBe("_claude/sdkMessage");
+    }
+
+    agent.sessions["s1"]!.abortController.abort();
+    query.close();
+  });
+
+  it("emits raw SDK messages in FIFO order (single side-effect chain)", async () => {
+    const { client, extNotifications } = createCaptureClient();
+    const agent = createAgent(client);
+    const query = new QueryStub();
+    const input = new Pushable<any>();
+    buildSession("s1", agent, query, input, { emitRawSDKMessages: true });
+
+    // Push several off-turn lifecycle messages; each is raw-emitted on the
+    // readerSideEffects chain. Order among raw emits must match push order.
+    for (let i = 0; i < 5; i++) {
+      query.push({
+        type: "system",
+        subtype: "task_started",
+        task_id: `t${i}`,
+        description: `task ${i}`,
+        uuid: `u${i}`,
+        session_id: "s1",
+      });
+    }
+
+    await vi.waitFor(() => expect(extNotifications.length).toBe(5));
+    const ids = extNotifications.map((n) => n.params.message.task_id);
+    expect(ids).toEqual(["t0", "t1", "t2", "t3", "t4"]);
+
+    agent.sessions["s1"]!.abortController.abort();
+    query.close();
+  });
+
+  it("renders a real followup end-to-end via #emitFollowup (content + usage_update)", async () => {
+    const { client, sessionUpdates } = createCaptureClient();
+    const agent = createAgent(client);
+    const query = new QueryStub();
+    const input = new Pushable<any>();
+    // useRealFollowup binds the off-turn collector to the production
+    // #emitFollowup so the actual render path runs (not a capturing stub).
+    const session = buildSession("s1", agent, query, input, { useRealFollowup: true });
+
+    // A followup: an assistant message carrying a tool_use block (text is
+    // filtered out since it would be streamed), closed by a task-notification
+    // result.
+    query.push({
+      type: "assistant",
+      message: {
+        role: "assistant",
+        model: "claude-sonnet-4-6",
+        content: [
+          { type: "text", text: "streamed-elsewhere" },
+          { type: "tool_use", id: "tu1", name: "Bash", input: { command: "ls" } },
+        ],
+        usage: {
+          input_tokens: 12,
+          output_tokens: 8,
+          cache_read_input_tokens: 0,
+          cache_creation_input_tokens: 0,
+        },
+      },
+      parent_tool_use_id: null,
+      uuid: "a1",
+      session_id: "s1",
+    });
+    query.push({
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      result: "done",
+      stop_reason: "end_turn",
+      num_turns: 1,
+      duration_ms: 1,
+      duration_api_ms: 1,
+      total_cost_usd: 0.25,
+      usage: {
+        input_tokens: 12,
+        output_tokens: 8,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+      },
+      modelUsage: {},
+      permission_denials: [],
+      origin: { kind: "task-notification" },
+      uuid: "r1",
+      session_id: "s1",
+    });
+
+    await vi.waitFor(() => {
+      expect(query.isIdle()).toBe(true);
+      expect(session.offTurn.inspect().state).toBe("idle");
+    });
+    // Drain the detached side-effect chain that #emitFollowup runs on.
+    await session.readerSideEffects;
+
+    // The tool_use rendered as a tool_call, and a usage_update closed the
+    // followup with the task-notification origin in _meta.
+    const toolCalls = sessionUpdates.filter((u) => u.update.sessionUpdate === "tool_call");
+    expect(toolCalls.length).toBeGreaterThanOrEqual(1);
+    const usage = sessionUpdates.filter((u) => u.update.sessionUpdate === "usage_update");
+    expect(usage.length).toBe(1);
+    expect(usage[0].update.used).toBe(20); // 12 + 8 (+0 +0)
+    expect(usage[0].update.cost.amount).toBe(0.25);
+    expect(usage[0].update._meta?.["_claude/origin"]).toEqual({ kind: "task-notification" });
+    // The followup must not touch the user-turn accumulator.
+    expect(session.accumulatedUsage.inputTokens).toBe(0);
+    expect(session.accumulatedUsage.outputTokens).toBe(0);
+
+    agent.sessions["s1"]!.abortController.abort();
+    query.close();
+  });
+
+  it("forwards a followup's assembled text when no content_block_delta streamed (non-streaming gateway)", async () => {
+    const { client, sessionUpdates } = createCaptureClient();
+    const agent = createAgent(client);
+    const query = new QueryStub();
+    const input = new Pushable<any>();
+    const session = buildSession("s1", agent, query, input, { useRealFollowup: true });
+
+    // A non-streaming gateway delivers the followup as one assembled assistant
+    // message with no preceding deltas. The text block is the only copy, so it
+    // must be forwarded rather than filtered. Mirrors #757 for the off-turn path.
+    query.push({
+      type: "assistant",
+      message: {
+        // A non-streaming gateway still stamps the assembled block with an API
+        // id. Include it so the dedup lookup runs against a real id (absent
+        // from streamedTextIds) rather than passing only because the set is
+        // empty — this guards the id-keying path, not just the empty-set case.
+        id: "msg-nonstream-1",
+        role: "assistant",
+        model: "claude-sonnet-4-6",
+        content: [{ type: "text", text: "the followup answer" }],
+        usage: {
+          input_tokens: 5,
+          output_tokens: 3,
+          cache_read_input_tokens: 0,
+          cache_creation_input_tokens: 0,
+        },
+      },
+      parent_tool_use_id: null,
+      uuid: "a1",
+      session_id: "s1",
+    });
+    query.push({
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      result: "done",
+      stop_reason: "end_turn",
+      num_turns: 1,
+      duration_ms: 1,
+      duration_api_ms: 1,
+      total_cost_usd: 0.1,
+      usage: {
+        input_tokens: 5,
+        output_tokens: 3,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+      },
+      modelUsage: {},
+      permission_denials: [],
+      origin: { kind: "task-notification" },
+      uuid: "r1",
+      session_id: "s1",
+    });
+
+    await vi.waitFor(() => {
+      expect(query.isIdle()).toBe(true);
+      expect(session.offTurn.inspect().state).toBe("idle");
+    });
+    await session.readerSideEffects;
+
+    const texts = sessionUpdates
+      .filter((u) => u.update.sessionUpdate === "agent_message_chunk")
+      .map((u) => u.update.content.text);
+    expect(texts).toContain("the followup answer");
+
+    agent.sessions["s1"]!.abortController.abort();
+    query.close();
+  });
+
+  it("does not re-emit a followup's text that already streamed via content_block_delta", async () => {
+    const { client, sessionUpdates } = createCaptureClient();
+    const agent = createAgent(client);
+    const query = new QueryStub();
+    const input = new Pushable<any>();
+    const session = buildSession("s1", agent, query, input, { useRealFollowup: true });
+
+    // Normal streaming: the followup's deltas arrive, then the consolidated
+    // assistant message repeats the same text. The assembled block must be
+    // dropped so the client doesn't see it twice.
+    query.push({
+      type: "stream_event",
+      event: { type: "message_start", message: { id: "msg-fu", usage: {} } },
+      parent_tool_use_id: null,
+      uuid: "s0",
+      session_id: "s1",
+    });
+    query.push({
+      type: "stream_event",
+      event: {
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "text_delta", text: "streamed answer" },
+      },
+      parent_tool_use_id: null,
+      uuid: "s1d",
+      session_id: "s1",
+    });
+    query.push({
+      type: "assistant",
+      message: {
+        id: "msg-fu",
+        role: "assistant",
+        model: "claude-sonnet-4-6",
+        content: [{ type: "text", text: "streamed answer" }],
+        usage: {
+          input_tokens: 5,
+          output_tokens: 3,
+          cache_read_input_tokens: 0,
+          cache_creation_input_tokens: 0,
+        },
+      },
+      parent_tool_use_id: null,
+      uuid: "a1",
+      session_id: "s1",
+    });
+    query.push({
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      result: "done",
+      stop_reason: "end_turn",
+      num_turns: 1,
+      duration_ms: 1,
+      duration_api_ms: 1,
+      total_cost_usd: 0.1,
+      usage: {
+        input_tokens: 5,
+        output_tokens: 3,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+      },
+      modelUsage: {},
+      permission_denials: [],
+      origin: { kind: "task-notification" },
+      uuid: "r1",
+      session_id: "s1",
+    });
+
+    await vi.waitFor(() => {
+      expect(query.isIdle()).toBe(true);
+      expect(session.offTurn.inspect().state).toBe("idle");
+    });
+    await session.readerSideEffects;
+
+    // "streamed answer" reaches the client once (via the delta), not twice.
+    const occurrences = sessionUpdates
+      .filter((u) => u.update.sessionUpdate === "agent_message_chunk")
+      .map((u) => u.update.content.text)
+      .filter((t) => t === "streamed answer");
+    expect(occurrences.length).toBe(1);
+
+    agent.sessions["s1"]!.abortController.abort();
+    query.close();
+  });
+
+  it("forwards an autonomous task-notification followup out-of-turn", async () => {
+    const { client, sessionUpdates } = createCaptureClient();
+    const agent = createAgent(client);
+    const query = new QueryStub();
+    const input = new Pushable<any>();
+    // Wire the off-turn collector to call the production #emitFollowup via
+    // an internal test-only adapter. Easier: replace the offTurn with one
+    // bound to a directly-spy emitter that captures.
+    const flushed: Array<{ msgs: any[]; result: any }> = [];
+    const session = buildSession("s1", agent, query, input);
+    session.offTurn = new OffTurnFollowupCollector(
+      "s1",
+      async (msgs, result) => {
+        flushed.push({ msgs, result });
+      },
+      { log: () => {}, error: () => {} },
+    );
+
+    query.push({
+      type: "assistant",
+      message: { role: "assistant", content: [{ type: "text", text: "followup body" }] },
+      parent_tool_use_id: null,
+      uuid: "u1",
+      session_id: "s1",
+    });
+    query.push({
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      result: "done",
+      stop_reason: "end_turn",
+      num_turns: 1,
+      duration_ms: 1,
+      duration_api_ms: 1,
+      total_cost_usd: 0.1,
+      usage: {
+        input_tokens: 10,
+        output_tokens: 5,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+      },
+      modelUsage: {},
+      permission_denials: [],
+      origin: { kind: "task-notification" },
+      uuid: "u2",
+      session_id: "s1",
+    });
+
+    await vi.waitFor(() => expect(flushed.length).toBe(1));
+    expect(flushed[0].msgs.length).toBe(1);
+    expect(flushed[0].msgs[0].type).toBe("assistant");
+    expect(flushed[0].result.origin.kind).toBe("task-notification");
+    expect(sessionUpdates.length).toBe(0); // followup is forwarded via the bound emitter, not sessionUpdate
+
+    agent.sessions["s1"]!.abortController.abort();
+    query.close();
+  });
+
+  it("does not contaminate the next user prompt's usage_update with a prior followup", async () => {
+    // The off-turn collector drains and forwards followups via its
+    // own emitter; the next prompt() starts with a fresh
+    // accumulatedUsage and never sees the followup messages in its loop.
+    const { client, sessionUpdates } = createCaptureClient();
+    const agent = createAgent(client);
+    const query = new QueryStub();
+    const input = new Pushable<any>();
+    const session = buildSession("s1", agent, query, input);
+
+    // Drive a followup off-turn.
+    query.push({
+      type: "assistant",
+      message: { role: "assistant", content: [{ type: "text", text: "fu" }] },
+      parent_tool_use_id: null,
+      uuid: "u1",
+      session_id: "s1",
+    });
+    query.push({
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      result: "ok",
+      stop_reason: "end_turn",
+      num_turns: 1,
+      duration_ms: 1,
+      duration_api_ms: 1,
+      total_cost_usd: 1,
+      usage: {
+        input_tokens: 1000,
+        output_tokens: 500,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+      },
+      modelUsage: {},
+      permission_denials: [],
+      origin: { kind: "task-notification" },
+      uuid: "u2",
+      session_id: "s1",
+    });
+
+    // Wait for the reader to drain everything we pushed and park on next().
+    // Asserting on `session.offTurn.inspect().state === 'idle'` alone is
+    // not enough: the collector starts in 'idle' too, so the assertion can
+    // pass before the reader has consumed any message. Reader-parked + the
+    // collector having returned to idle is what we actually need.
+    await vi.waitFor(() => {
+      expect(query.isIdle()).toBe(true);
+      expect(session.offTurn.inspect().state).toBe("idle");
+    });
+
+    // Now run a real user turn. The reader should not replay any
+    // followup-tokens into accumulatedUsage.
+    const userTurnReplay = {
+      type: "user",
+      message: { role: "user", content: "hi" },
+      parent_tool_use_id: null,
+      isReplay: true,
+      uuid: "u3",
+      session_id: "s1",
+    };
+    const turnResult = {
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      result: "answer",
+      stop_reason: "end_turn",
+      num_turns: 1,
+      duration_ms: 1,
+      duration_api_ms: 1,
+      total_cost_usd: 0.05,
+      usage: {
+        input_tokens: 7,
+        output_tokens: 3,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+      },
+      modelUsage: {},
+      permission_denials: [],
+      uuid: "u4",
+      session_id: "s1",
+    };
+    const idle = {
+      type: "system",
+      subtype: "session_state_changed",
+      state: "idle",
+    };
+    // Push these so they're ready when prompt() starts.
+    query.push(userTurnReplay);
+    query.push(turnResult);
+    query.push(idle);
+
+    const r = await agent.prompt({
+      sessionId: "s1",
+      prompt: [{ type: "text", text: "hi" }],
+    });
+    expect(r.stopReason).toBe("end_turn");
+    expect(session.accumulatedUsage.inputTokens).toBe(7);
+    expect(session.accumulatedUsage.outputTokens).toBe(3);
+    // No "Please run /login" tripwire from a stale result, no usage_update
+    // with the followup's 1000+500.
+    const usageUpdates = sessionUpdates.filter((u) => u.update.sessionUpdate === "usage_update");
+    for (const u of usageUpdates) {
+      expect(u.update.used).not.toBe(1500);
+    }
+
+    agent.sessions["s1"]!.abortController.abort();
+    query.close();
+  });
+
+  it("does not throw authRequired for a followup result.result containing 'Please run /login'", async () => {
+    const { client } = createCaptureClient();
+    const agent = createAgent(client);
+    const query = new QueryStub();
+    const input = new Pushable<any>();
+    const flushed: any[] = [];
+    const session = buildSession("s1", agent, query, input);
+    session.offTurn = new OffTurnFollowupCollector(
+      "s1",
+      async (msgs, result) => {
+        flushed.push({ msgs, result });
+      },
+      { log: () => {}, error: () => {} },
+    );
+
+    query.push({
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      result: "Please run /login",
+      stop_reason: "end_turn",
+      num_turns: 1,
+      duration_ms: 1,
+      duration_api_ms: 1,
+      total_cost_usd: 0,
+      usage: {
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+      },
+      modelUsage: {},
+      permission_denials: [],
+      origin: { kind: "task-notification" },
+      uuid: "u",
+      session_id: "s1",
+    });
+
+    await vi.waitFor(() => expect(flushed.length).toBe(1));
+    // The reader stayed up; no throw escaped.
+    expect(session.offTurn.inspect().state).toBe("idle");
+
+    agent.sessions["s1"]!.abortController.abort();
+    query.close();
+  });
+
+  it("forwards lifecycle in the middle of a followup-candidate without breaking the FSM", async () => {
+    const { client, sessionUpdates } = createCaptureClient();
+    const agent = createAgent(client);
+    const query = new QueryStub();
+    const input = new Pushable<any>();
+    const flushed: any[] = [];
+    const session = buildSession("s1", agent, query, input);
+    session.offTurn = new OffTurnFollowupCollector(
+      "s1",
+      async (msgs, result) => {
+        flushed.push({ msgs, result });
+      },
+      { log: () => {}, error: () => {} },
+    );
+
+    // Start a followup candidate.
+    query.push({
+      type: "assistant",
+      message: { role: "assistant", content: [{ type: "text", text: "a" }] },
+      parent_tool_use_id: null,
+      uuid: "u1",
+      session_id: "s1",
+    });
+    // Lifecycle slips in mid-candidate — should be forwarded immediately,
+    // not added to the buffer.
+    query.push({
+      type: "system",
+      subtype: "task_started",
+      task_id: "t2",
+      description: "concurrent",
+      uuid: "u2",
+      session_id: "s1",
+    });
+    // Close the candidate with a followup result.
+    query.push({
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      result: "ok",
+      stop_reason: "end_turn",
+      num_turns: 1,
+      duration_ms: 1,
+      duration_api_ms: 1,
+      total_cost_usd: 0,
+      usage: {
+        input_tokens: 1,
+        output_tokens: 1,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+      },
+      modelUsage: {},
+      permission_denials: [],
+      origin: { kind: "task-notification" },
+      uuid: "u3",
+      session_id: "s1",
+    });
+
+    await vi.waitFor(() => expect(flushed.length).toBe(1));
+    // The lifecycle was forwarded as a sessionUpdate.
+    expect(sessionUpdates.some((u) => u.update.content?.text?.includes("[task t2] started"))).toBe(
+      true,
+    );
+    // The buffer contained only the assistant, not the lifecycle.
+    expect(flushed[0].msgs.length).toBe(1);
+    expect(flushed[0].msgs[0].type).toBe("assistant");
+
+    agent.sessions["s1"]!.abortController.abort();
+    query.close();
+  });
+
+  it("does not let a slow lifecycle sessionUpdate block a later prompt", async () => {
+    let releaseLifecycle!: () => void;
+    const lifecycleBlocked = new Promise<void>((resolve) => {
+      releaseLifecycle = resolve;
+    });
+    const client = {
+      sessionUpdate: vi.fn(async () => {
+        await lifecycleBlocked;
+      }),
+      extNotification: vi.fn(async () => {}),
+    } as unknown as AgentSideConnection;
+    const agent = createAgent(client);
+    const query = new QueryStub();
+    const input = new Pushable<any>();
+    buildSession("s1", agent, query, input);
+
+    query.push({
+      type: "system",
+      subtype: "task_notification",
+      task_id: "t-slow",
+      status: "completed",
+      summary: "slow client",
+      uuid: "u-slow",
+      session_id: "s1",
+    });
+    await vi.waitFor(() => expect(client.sessionUpdate).toHaveBeenCalledTimes(1));
+
+    const promptDone = agent.prompt({
+      sessionId: "s1",
+      prompt: [{ type: "text", text: "hi" }],
+    });
+    query.push({
+      type: "user",
+      message: { role: "user", content: "hi" },
+      parent_tool_use_id: null,
+      isReplay: true,
+      uuid: "u1",
+      session_id: "s1",
+    });
+    query.push({
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      result: "ok",
+      stop_reason: "end_turn",
+      num_turns: 1,
+      duration_ms: 1,
+      duration_api_ms: 1,
+      total_cost_usd: 0,
+      usage: {
+        input_tokens: 2,
+        output_tokens: 1,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+      },
+      modelUsage: {},
+      permission_denials: [],
+      uuid: "u2",
+      session_id: "s1",
+    });
+    query.push({
+      type: "system",
+      subtype: "session_state_changed",
+      state: "idle",
+      session_id: "s1",
+    });
+
+    await expect(promptDone).resolves.toMatchObject({ stopReason: "end_turn" });
+    releaseLifecycle();
+    agent.sessions["s1"]!.abortController.abort();
+    query.close();
+  });
+
+  it("clears queued turn leftovers after a prompt error", async () => {
+    let releaseFirstUpdate!: () => void;
+    let blockFirstUpdate = true;
+    const firstUpdateBlocked = new Promise<void>((resolve) => {
+      releaseFirstUpdate = resolve;
+    });
+    const { client } = createCaptureClient();
+    vi.mocked(client.sessionUpdate).mockImplementation(async () => {
+      if (blockFirstUpdate) {
+        blockFirstUpdate = false;
+        await firstUpdateBlocked;
+      }
+    });
+    const agent = createAgent(client);
+    const query = new QueryStub();
+    const input = new Pushable<any>();
+    const session = buildSession("s1", agent, query, input);
+
+    const firstPrompt = agent.prompt({
+      sessionId: "s1",
+      prompt: [{ type: "text", text: "first" }],
+    });
+    query.push({
+      type: "system",
+      subtype: "local_command_output",
+      content: "blocking update",
+      uuid: "u-block",
+      session_id: "s1",
+    });
+    await vi.waitFor(() => expect(client.sessionUpdate).toHaveBeenCalledTimes(1));
+    query.push({
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      result: "Please run /login",
+      stop_reason: "end_turn",
+      num_turns: 1,
+      duration_ms: 1,
+      duration_api_ms: 1,
+      total_cost_usd: 0,
+      usage: {
+        input_tokens: 100,
+        output_tokens: 100,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+      },
+      modelUsage: {},
+      permission_denials: [],
+      uuid: "u-stale-result",
+      session_id: "s1",
+    });
+    query.push({
+      type: "system",
+      subtype: "session_state_changed",
+      state: "idle",
+      uuid: "u-stale-idle",
+      session_id: "s1",
+    });
+    await vi.waitFor(() => expect(session.turnQueue.size()).toBeGreaterThan(0));
+    releaseFirstUpdate();
+    await expect(firstPrompt).rejects.toThrow();
+    expect(session.turnQueue.size()).toBe(0);
+
+    const secondPrompt = agent.prompt({
+      sessionId: "s1",
+      prompt: [{ type: "text", text: "second" }],
+    });
+    query.push({
+      type: "user",
+      message: { role: "user", content: "second" },
+      parent_tool_use_id: null,
+      isReplay: true,
+      uuid: "u-next-user",
+      session_id: "s1",
+    });
+    query.push({
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      result: "ok",
+      stop_reason: "end_turn",
+      num_turns: 1,
+      duration_ms: 1,
+      duration_api_ms: 1,
+      total_cost_usd: 0,
+      usage: {
+        input_tokens: 4,
+        output_tokens: 2,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+      },
+      modelUsage: {},
+      permission_denials: [],
+      uuid: "u-next-result",
+      session_id: "s1",
+    });
+    query.push({
+      type: "system",
+      subtype: "session_state_changed",
+      state: "idle",
+      uuid: "u-next-idle",
+      session_id: "s1",
+    });
+
+    await expect(secondPrompt).resolves.toMatchObject({ stopReason: "end_turn" });
+    expect(session.accumulatedUsage.inputTokens).toBe(4);
+    expect(session.accumulatedUsage.outputTokens).toBe(2);
+
+    agent.sessions["s1"]!.abortController.abort();
+    query.close();
+  });
+
+  it("discards orphan off-turn messages followed by an idle", async () => {
+    const { client } = createCaptureClient();
+    const agent = createAgent(client);
+    const query = new QueryStub();
+    const input = new Pushable<any>();
+    const session = buildSession("s1", agent, query, input);
+
+    query.push({
+      type: "assistant",
+      message: { role: "assistant", content: [{ type: "text", text: "x" }] },
+      parent_tool_use_id: null,
+      uuid: "u",
+      session_id: "s1",
+    });
+    query.push({
+      type: "system",
+      subtype: "session_state_changed",
+      state: "idle",
+      uuid: "u2",
+      session_id: "s1",
+    });
+
+    // Wait until the reader has drained the queue and parked on next();
+    // only then is the buffer state reliable.
+    await vi.waitFor(() => {
+      expect(query.isIdle()).toBe(true);
+      expect(session.offTurn.inspect().state).toBe("idle");
+    });
+    expect(session.offTurn.inspect().bufferSize).toBe(0);
+
+    agent.sessions["s1"]!.abortController.abort();
+    query.close();
+  });
+
+  it("discards off-turn messages followed by a non-followup result", async () => {
+    const { client } = createCaptureClient();
+    const agent = createAgent(client);
+    const query = new QueryStub();
+    const input = new Pushable<any>();
+    const flushed: any[] = [];
+    const session = buildSession("s1", agent, query, input);
+    session.offTurn = new OffTurnFollowupCollector(
+      "s1",
+      async (msgs, result) => {
+        flushed.push({ msgs, result });
+      },
+      { log: () => {}, error: () => {} },
+    );
+
+    query.push({
+      type: "assistant",
+      message: { role: "assistant", content: [{ type: "text", text: "x" }] },
+      parent_tool_use_id: null,
+      uuid: "u",
+      session_id: "s1",
+    });
+    query.push({
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      result: "ok",
+      stop_reason: "end_turn",
+      num_turns: 1,
+      duration_ms: 1,
+      duration_api_ms: 1,
+      total_cost_usd: 0,
+      usage: {
+        input_tokens: 1,
+        output_tokens: 1,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+      },
+      modelUsage: {},
+      permission_denials: [],
+      // No origin field → not a followup.
+      uuid: "u2",
+      session_id: "s1",
+    });
+
+    await vi.waitFor(() => {
+      expect(query.isIdle()).toBe(true);
+      expect(session.offTurn.inspect().state).toBe("idle");
+    });
+    expect(flushed.length).toBe(0);
+
+    agent.sessions["s1"]!.abortController.abort();
+    query.close();
+  });
+
+  it("cancellation aftermath is discarded by the reader, not replayed into the next turn", async () => {
+    // After a cancel() interrupt, the SDK can emit a tail of messages
+    // (a result with the interrupted turn and an idle). The reader sees
+    // them off-turn because prompt() already returned. The off-turn
+    // collector discards them — they must not contaminate the next user
+    // prompt's accumulatedUsage or stopReason.
+    const { client, sessionUpdates } = createCaptureClient();
+    const agent = createAgent(client);
+    const query = new QueryStub();
+    const input = new Pushable<any>();
+    const session = buildSession("s1", agent, query, input);
+
+    // Run a turn, then send a cancelled idle so prompt() returns cancelled.
+    const firstPrompt = agent.prompt({
+      sessionId: "s1",
+      prompt: [{ type: "text", text: "first" }],
+    });
+
+    query.push({
+      type: "user",
+      message: { role: "user", content: "first" },
+      parent_tool_use_id: null,
+      isReplay: true,
+      uuid: "u1",
+      session_id: "s1",
+    });
+    // Simulate cancel mid-turn: cancelled=true + idle to end the turn.
+    session.cancelled = true;
+    query.push({
+      type: "system",
+      subtype: "session_state_changed",
+      state: "idle",
+    });
+    const first = await firstPrompt;
+    expect(first.stopReason).toBe("cancelled");
+
+    // Aftermath that the SDK might emit AFTER the interrupted turn ended.
+    query.push({
+      type: "assistant",
+      message: { role: "assistant", content: [{ type: "text", text: "stale" }] },
+      parent_tool_use_id: null,
+      uuid: "u2",
+      session_id: "s1",
+    });
+    query.push({
+      type: "result",
+      subtype: "error_during_execution",
+      is_error: false,
+      result: "interrupted",
+      stop_reason: "interrupted",
+      errors: [],
+      num_turns: 1,
+      duration_ms: 1,
+      duration_api_ms: 1,
+      total_cost_usd: 0,
+      usage: {
+        input_tokens: 9999,
+        output_tokens: 9999,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+      },
+      modelUsage: {},
+      permission_denials: [],
+      uuid: "u3",
+      session_id: "s1",
+    });
+    query.push({
+      type: "system",
+      subtype: "session_state_changed",
+      state: "idle",
+    });
+
+    // Wait for the reader to drain the aftermath.
+    await vi.waitFor(() => {
+      expect(query.isIdle()).toBe(true);
+      expect(session.offTurn.inspect().state).toBe("idle");
+    });
+
+    // Reset session.cancelled and run the next user turn cleanly.
+    session.cancelled = false;
+    const secondPrompt = agent.prompt({
+      sessionId: "s1",
+      prompt: [{ type: "text", text: "second" }],
+    });
+    query.push({
+      type: "user",
+      message: { role: "user", content: "second" },
+      parent_tool_use_id: null,
+      isReplay: true,
+      uuid: "u4",
+      session_id: "s1",
+    });
+    query.push({
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      result: "ok",
+      stop_reason: "end_turn",
+      num_turns: 1,
+      duration_ms: 1,
+      duration_api_ms: 1,
+      total_cost_usd: 0,
+      usage: {
+        input_tokens: 4,
+        output_tokens: 2,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+      },
+      modelUsage: {},
+      permission_denials: [],
+      uuid: "u5",
+      session_id: "s1",
+    });
+    query.push({
+      type: "system",
+      subtype: "session_state_changed",
+      state: "idle",
+    });
+
+    const second = await secondPrompt;
+    expect(second.stopReason).toBe("end_turn");
+    // The aftermath's 9999/9999 must not be in the second turn's usage.
+    expect(session.accumulatedUsage.inputTokens).toBe(4);
+    expect(session.accumulatedUsage.outputTokens).toBe(2);
+    // And no usage_update was emitted for the aftermath result.
+    const usageUpdates = sessionUpdates.filter((u) => u.update.sessionUpdate === "usage_update");
+    for (const u of usageUpdates) {
+      expect(u.update.used).not.toBe(9999 * 2);
+    }
+
+    agent.sessions["s1"]!.abortController.abort();
+    query.close();
+  });
+
+  it("process-died throw in reader propagates to the active prompt as an error", async () => {
+    const { client } = createCaptureClient();
+    const agent = createAgent(client);
+    const query = new QueryStub();
+    const input = new Pushable<any>();
+    buildSession("s1", agent, query, input);
+
+    const promptPromise = agent.prompt({
+      sessionId: "s1",
+      prompt: [{ type: "text", text: "hi" }],
+    });
+    // Give the reader a chance to grab its first next() and prompt() a
+    // chance to set promptRunning + start awaiting turnQueue.
+    await new Promise((r) => setTimeout(r, 5));
+
+    query.throwOnNext(new Error("process exited with code 1"));
+
+    await expect(promptPromise).rejects.toBeInstanceOf(Error);
+
+    // Session entry should have been cleaned up by the process-died path.
+    expect(agent.sessions["s1"]).toBeUndefined();
+  });
+
+  it("tears down the session when the reader dies on a non-process-death iterator error", async () => {
+    const { client } = createCaptureClient();
+    const agent = createAgent(client);
+    const query = new QueryStub();
+    const input = new Pushable<any>();
+    buildSession("s1", agent, query, input);
+
+    const promptPromise = agent.prompt({
+      sessionId: "s1",
+      prompt: [{ type: "text", text: "hi" }],
+    });
+    await new Promise((r) => setTimeout(r, 5));
+
+    // An error whose message matches none of the process-death substrings.
+    // The reader errors the turnQueue and exits; without teardown the queue's
+    // latched error would brick every future prompt() on this session.
+    query.throwOnNext(new Error("Unexpected event order, got delta before message_start"));
+
+    await expect(promptPromise).rejects.toBeInstanceOf(Error);
+    // The dead reader can never feed this session again, so it must be removed
+    // rather than left in the map with a permanently errored queue. See #336.
+    expect(agent.sessions["s1"]).toBeUndefined();
+  });
+
+  it("returns cancelled (not an error) when a force-cancel races an iterator throw", async () => {
+    const { client } = createCaptureClient();
+    const agent = createAgent(client);
+    const query = new QueryStub();
+    const input = new Pushable<any>();
+    const session = buildSession("s1", agent, query, input);
+
+    const promptPromise = agent.prompt({
+      sessionId: "s1",
+      prompt: [{ type: "text", text: "hi" }],
+    });
+    await new Promise((r) => setTimeout(r, 5));
+
+    // Reproduce the race where the take() rejection wins: cancel() has set
+    // session.cancelled but the force-cancel timer has NOT yet aborted the
+    // wake-up channel (so the `cancelled` promise never resolves), and the
+    // iterator throws. The rejection propagates through Promise.race into the
+    // catch, bypassing the line-level aborted check. The catch must still
+    // honor the cancel contract via session.cancelled and return "cancelled"
+    // rather than surfacing the trailing error as an internal error. See
+    // #680/#336.
+    session.cancelled = true;
+    query.throwOnNext(new Error("stream has ended, this shouldn't happen"));
+
+    await expect(promptPromise).resolves.toEqual({ stopReason: "cancelled" });
+  });
+
+  it("teardownSession awaits the reader before deleting the session entry", async () => {
+    const { client } = createCaptureClient();
+    const agent = createAgent(client);
+    const query = new QueryStub();
+    const input = new Pushable<any>();
+    buildSession("s1", agent, query, input);
+    const readerDone = agent.sessions["s1"]!.readerDone;
+
+    let resolved = false;
+    void readerDone.then(() => {
+      resolved = true;
+    });
+
+    // teardownSession is private; reach it via the public closeSession.
+    const teardownPromise = (
+      agent as unknown as { teardownSession(id: string): Promise<void> }
+    ).teardownSession("s1");
+
+    // The reader exits when query.close() fires from teardown; resolve it.
+    query.close();
+    await teardownPromise;
+    expect(resolved).toBe(true);
+    expect(agent.sessions["s1"]).toBeUndefined();
+  });
+
+  it("drops queued reader side effects after the session entry is replaced", async () => {
+    let releaseFirstUpdate!: () => void;
+    const firstUpdateBlocked = new Promise<void>((resolve) => {
+      releaseFirstUpdate = resolve;
+    });
+    const { client, sessionUpdates } = createCaptureClient();
+    vi.mocked(client.sessionUpdate).mockImplementation(async (n: any) => {
+      sessionUpdates.push(n);
+      if (sessionUpdates.length === 1) {
+        await firstUpdateBlocked;
+      }
+    });
+    const agent = createAgent(client);
+    const query = new QueryStub();
+    const input = new Pushable<any>();
+    const oldSession = buildSession("s1", agent, query, input);
+
+    query.push({
+      type: "system",
+      subtype: "task_started",
+      task_id: "old-1",
+      description: "already running",
+      uuid: "u1",
+      session_id: "s1",
+    });
+    query.push({
+      type: "system",
+      subtype: "task_started",
+      task_id: "old-2",
+      description: "queued stale side effect",
+      uuid: "u2",
+      session_id: "s1",
+    });
+
+    await vi.waitFor(() => expect(sessionUpdates.length).toBe(1));
+
+    oldSession.abortController.abort();
+    query.close();
+    delete agent.sessions["s1"];
+
+    const replacementQuery = new QueryStub();
+    const replacementInput = new Pushable<any>();
+    const replacementSession = buildSession("s1", agent, replacementQuery, replacementInput);
+
+    releaseFirstUpdate();
+    await oldSession.readerSideEffects;
+    await Promise.resolve();
+
+    expect(sessionUpdates).toHaveLength(1);
+    expect(sessionUpdates[0].update.content.text).toContain("[task old-1]");
+
+    replacementSession.abortController.abort();
+    replacementQuery.close();
+  });
+
+  it("teardownSession drains a pending reader side effect before deleting the session", async () => {
+    let releaseUpdate!: () => void;
+    let updateStarted = false;
+    const { client, sessionUpdates } = createCaptureClient();
+    vi.mocked(client.sessionUpdate).mockImplementation(async (n: any) => {
+      sessionUpdates.push(n);
+      updateStarted = true;
+      await new Promise<void>((resolve) => {
+        releaseUpdate = resolve;
+      });
+    });
+    const agent = createAgent(client);
+    const query = new QueryStub();
+    const input = new Pushable<any>();
+    buildSession("s1", agent, query, input);
+
+    // A lifecycle message schedules a (slow) sessionUpdate on the detached
+    // readerSideEffects chain.
+    query.push({
+      type: "system",
+      subtype: "task_started",
+      task_id: "t1",
+      description: "slow",
+      uuid: "u1",
+      session_id: "s1",
+    });
+    await vi.waitFor(() => expect(updateStarted).toBe(true));
+
+    let teardownResolved = false;
+    const teardownPromise = (agent as unknown as { teardownSession(id: string): Promise<void> })
+      .teardownSession("s1")
+      .then(() => {
+        teardownResolved = true;
+      });
+    query.close();
+
+    // readerDone resolves quickly (reader loop exits on close), but the
+    // side-effect chain is still blocked on the slow sessionUpdate, so
+    // teardown must not have resolved yet.
+    await new Promise((r) => setTimeout(r, 20));
+    expect(teardownResolved).toBe(false);
+
+    releaseUpdate();
+    await teardownPromise;
+    expect(teardownResolved).toBe(true);
+    expect(agent.sessions["s1"]).toBeUndefined();
+  });
+
+  it("stops a multi-update followup side effect if the session entry is replaced mid-emit", async () => {
+    let releaseFirstUpdate!: () => void;
+    const firstUpdateBlocked = new Promise<void>((resolve) => {
+      releaseFirstUpdate = resolve;
+    });
+    const { client, sessionUpdates } = createCaptureClient();
+    vi.mocked(client.sessionUpdate).mockImplementation(async (n: any) => {
+      sessionUpdates.push(n);
+      if (sessionUpdates.length === 1) {
+        await firstUpdateBlocked;
+      }
+    });
+    const agent = createAgent(client);
+    const query = new QueryStub();
+    const input = new Pushable<any>();
+    const oldSession = buildSession("s1", agent, query, input, { useRealFollowup: true });
+
+    query.push({
+      type: "assistant",
+      message: {
+        role: "assistant",
+        model: "claude-sonnet-4-6",
+        content: [{ type: "tool_use", id: "tu-stale", name: "Bash", input: { command: "pwd" } }],
+        usage: {
+          input_tokens: 1,
+          output_tokens: 1,
+          cache_read_input_tokens: 0,
+          cache_creation_input_tokens: 0,
+        },
+      },
+      parent_tool_use_id: null,
+      uuid: "a-stale",
+      session_id: "s1",
+    });
+    query.push({
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      result: "done",
+      stop_reason: "end_turn",
+      num_turns: 1,
+      duration_ms: 1,
+      duration_api_ms: 1,
+      total_cost_usd: 0,
+      usage: {
+        input_tokens: 1,
+        output_tokens: 1,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+      },
+      modelUsage: {},
+      permission_denials: [],
+      origin: { kind: "task-notification" },
+      uuid: "r-stale",
+      session_id: "s1",
+    });
+
+    await vi.waitFor(() => expect(sessionUpdates.length).toBe(1));
+    oldSession.abortController.abort();
+    query.close();
+    delete agent.sessions["s1"];
+
+    const replacementQuery = new QueryStub();
+    const replacementInput = new Pushable<any>();
+    const replacementSession = buildSession("s1", agent, replacementQuery, replacementInput);
+
+    releaseFirstUpdate();
+    await oldSession.readerSideEffects;
+
+    expect(sessionUpdates).toHaveLength(1);
+    expect(sessionUpdates[0].update.sessionUpdate).toBe("tool_call");
+
+    replacementSession.abortController.abort();
+    replacementQuery.close();
+  });
+
+  it("drops leftover in-turn messages from the turnQueue when a turn is cancelled", async () => {
+    const { client } = createCaptureClient();
+    const agent = createAgent(client);
+    const query = new QueryStub();
+    const input = new Pushable<any>();
+    const session = buildSession("s1", agent, query, input);
+
+    const promptPromise = agent.prompt({
+      sessionId: "s1",
+      prompt: [{ type: "text", text: "hi" }],
+    });
+    await vi.waitFor(() => expect(session.promptRunning).toBe(true));
+
+    // The reader delivers the replay (consumed by prompt), then the SDK
+    // emits the cancelled idle followed by trailing aftermath. The prompt
+    // returns on the idle; the aftermath must not survive into the next turn.
+    query.push({
+      type: "user",
+      message: { role: "user", content: "hi" },
+      parent_tool_use_id: null,
+      isReplay: true,
+      uuid: "u1",
+      session_id: "s1",
+    });
+    session.cancelled = true;
+    query.push({ type: "system", subtype: "session_state_changed", state: "idle" });
+    query.push({
+      type: "assistant",
+      message: { role: "assistant", content: [{ type: "text", text: "stale" }] },
+      parent_tool_use_id: null,
+      uuid: "u2",
+      session_id: "s1",
+    });
+
+    const r = await promptPromise;
+    expect(r.stopReason).toBe("cancelled");
+
+    // The trailing aftermath arrives off-turn; its closing idle lets the
+    // collector discard it.
+    query.push({ type: "system", subtype: "session_state_changed", state: "idle" });
+    await vi.waitFor(() => {
+      expect(query.isIdle()).toBe(true);
+      expect(session.offTurn.inspect().state).toBe("idle");
+    });
+    // No leftover in the turnQueue from the cancelled turn, and the off-turn
+    // collector discarded the aftermath rather than holding it for replay.
+    expect(session.turnQueue.size()).toBe(0);
+    expect(session.offTurn.inspect().bufferSize).toBe(0);
+
+    agent.sessions["s1"]!.abortController.abort();
+    query.close();
+  });
+
+  it("single-consumer invariant: only one query.next() can be in flight", async () => {
+    const { client } = createCaptureClient();
+    const agent = createAgent(client);
+    const query = new QueryStub();
+    const input = new Pushable<any>();
+    buildSession("s1", agent, query, input);
+
+    // Push a few messages and let the reader drain them.
+    for (let i = 0; i < 5; i++) {
+      query.push({
+        type: "system",
+        subtype: "task_started",
+        task_id: `t${i}`,
+        description: `task ${i}`,
+        uuid: `u${i}`,
+        session_id: "s1",
+      });
+    }
+    await vi.waitFor(() => expect(query.nextCallCount).toBeGreaterThanOrEqual(5));
+    expect(query.maxConcurrentReads).toBe(1);
+
+    // Even with a concurrent prompt() and the reader cycling, only one
+    // next() at a time.
+    const promptDone = agent.prompt({
+      sessionId: "s1",
+      prompt: [{ type: "text", text: "hi" }],
+    });
+    query.push({
+      type: "user",
+      message: { role: "user", content: "hi" },
+      parent_tool_use_id: null,
+      isReplay: true,
+      uuid: "ur",
+      session_id: "s1",
+    });
+    query.push({
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      result: "ok",
+      stop_reason: "end_turn",
+      num_turns: 1,
+      duration_ms: 1,
+      duration_api_ms: 1,
+      total_cost_usd: 0,
+      usage: {
+        input_tokens: 1,
+        output_tokens: 1,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+      },
+      modelUsage: {},
+      permission_denials: [],
+      uuid: "urr",
+      session_id: "s1",
+    });
+    query.push({
+      type: "system",
+      subtype: "session_state_changed",
+      state: "idle",
+    });
+    await promptDone;
+    expect(query.maxConcurrentReads).toBe(1);
+
+    agent.sessions["s1"]!.abortController.abort();
+    query.close();
+  });
+
+  it("resumes a queued prompt with promptRunning re-asserted when the prior turn ends without replaying it (#336)", async () => {
+    // Regression: a prompt queued behind a running turn can be resumed via the
+    // finally-fallback in prompt() (the prior turn ended at idle without ever
+    // replaying the queued user message). That fallback sets promptRunning=false
+    // and *then* resolves the waiter, so the resumed prompt must re-assert
+    // promptRunning before reading the turnQueue. If it doesn't, the reader
+    // routes the resumed turn's messages off-turn (where the followup collector
+    // discards them) and the prompt hangs forever.
+    const { client } = createCaptureClient();
+    const agent = createAgent(client);
+    const query = new QueryStub();
+    const input = new Pushable<any>();
+    const session = buildSession("s1", agent, query, input);
+
+    const result = (usage: { input: number; output: number }, uuid: string) => ({
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      result: "ok",
+      stop_reason: "end_turn",
+      num_turns: 1,
+      duration_ms: 1,
+      duration_api_ms: 1,
+      total_cost_usd: 0,
+      usage: {
+        input_tokens: usage.input,
+        output_tokens: usage.output,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+      },
+      modelUsage: {},
+      permission_denials: [],
+      uuid,
+      session_id: "s1",
+    });
+    const idle = (uuid: string) => ({
+      type: "system",
+      subtype: "session_state_changed",
+      state: "idle",
+      uuid,
+      session_id: "s1",
+    });
+
+    // Prompt A takes the stream (else branch -> promptRunning=true).
+    const promptA = agent.prompt({ sessionId: "s1", prompt: [{ type: "text", text: "A" }] });
+    await vi.waitFor(() => expect(session.promptRunning).toBe(true));
+
+    // Prompt B arrives while A is running -> queued in pendingMessages.
+    const promptB = agent.prompt({ sessionId: "s1", prompt: [{ type: "text", text: "B" }] });
+    await vi.waitFor(() => expect(session.pendingMessages.size).toBe(1));
+
+    // A ends at idle without B's user message ever being replayed, so A never
+    // hands off; its finally resolves B through the fallback path.
+    query.push(result({ input: 0, output: 0 }, "u-a-result"));
+    query.push(idle("u-a-idle"));
+    await expect(promptA).resolves.toMatchObject({ stopReason: "end_turn" });
+
+    // The fix: B re-asserts promptRunning on resume. Without it this stays
+    // false (the fallback cleared it) and the assertion times out.
+    await vi.waitFor(() => expect(session.promptRunning).toBe(true));
+
+    // B's own turn is now routed into the turnQueue and consumed, not misrouted
+    // off-turn. B resolves with its result and its usage is accounted for.
+    query.push(result({ input: 7, output: 3 }, "u-b-result"));
+    query.push(idle("u-b-idle"));
+    await expect(promptB).resolves.toMatchObject({ stopReason: "end_turn" });
+    expect(session.accumulatedUsage.inputTokens).toBe(7);
+    expect(session.accumulatedUsage.outputTokens).toBe(3);
+
+    // Only the reader ever consumed the SDK iterator throughout the handoff.
+    expect(query.maxConcurrentReads).toBe(1);
+
+    session.abortController.abort();
+    query.close();
   });
 });

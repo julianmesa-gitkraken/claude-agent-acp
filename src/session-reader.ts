@@ -63,6 +63,17 @@ export class TurnQueue {
     this.buffer = [];
   }
 
+  /** Drop a pending take() without resolving or rejecting it. Used when the
+   *  consumer force-cancels a turn (issue #680) while the producer (the
+   *  session reader) is wedged in `query.next()` and will never push: the
+   *  promise returned by the abandoned take() is left dangling on purpose
+   *  (nobody awaits it after the cancel), and clearing the waiter lets the
+   *  next turn's take() proceed without tripping the single-consumer guard. */
+  abandonTake(): void {
+    this.waiter = null;
+    this.waiterReject = null;
+  }
+
   /** Push an error to the consumer. A pending consumer is rejected. */
   error(err: unknown): void {
     if (this.closed || this.hasError) return;
@@ -101,6 +112,16 @@ export class TurnQueue {
   /** Test/diagnostic: number of buffered messages awaiting take(). */
   size(): number {
     return this.buffer.length;
+  }
+
+  /** True once the queue has been closed or errored. Terminal state is
+   *  permanent (there is no reset): the session reader is the sole producer
+   *  and is spawned once, so a closed/errored queue means the reader has
+   *  exited and will never feed this queue again. prompt() uses this to
+   *  recognize a dead session and tear it down instead of failing every
+   *  future take() on the latched state. */
+  isTerminal(): boolean {
+    return this.closed || this.hasError;
   }
 }
 

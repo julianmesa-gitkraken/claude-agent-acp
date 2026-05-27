@@ -55,9 +55,12 @@ import {
   PermissionUpdate,
   Query,
   query,
+  SDKMessage,
+  SDKResultMessage,
+  SDKTaskNotificationMessage,
+  SDKTaskStartedMessage,
   Settings,
   SDKAssistantMessageError,
-  SDKMessage,
   SDKMessageOrigin,
   SDKPartialAssistantMessage,
   SDKUserMessage,
@@ -97,6 +100,7 @@ import {
   toolUpdateFromToolResult,
 } from "./tools.js";
 import { nodeToWebReadable, nodeToWebWritable, Pushable, unreachable } from "./utils.js";
+import { classifyOffTurn, OffTurnFollowupCollector, TurnQueue } from "./session-reader.js";
 
 export const CLAUDE_CONFIG_DIR =
   process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude");
@@ -156,6 +160,23 @@ const DEFAULT_CONTEXT_WINDOW = 200000;
  *  "obviously stuck" ceiling, not a guess at interrupt latency, so it can't
  *  pre-empt a slow-but-healthy interrupt. */
 const DEFAULT_FORCE_CANCEL_GRACE_MS = 30_000;
+
+/** How long teardown waits for the reader's detached side-effect chain
+ *  (`session.readerSideEffects`) to drain before deleting the session. A
+ *  wedged ACP client can't hang teardown past this. Side effects that have
+ *  not started by the time the session entry is deleted no-op via the
+ *  instance guard in `#enqueueReaderSideEffect`; an already-started client
+ *  request cannot be cancelled here. See #336. */
+const READER_SIDE_EFFECT_DRAIN_TIMEOUT_MS = 2000;
+
+/** How long teardown waits for the session reader (`session.readerDone`) to
+ *  exit before deleting the session. Normally the reader returns promptly once
+ *  the query is closed/aborted, but if the SDK iterator is genuinely wedged
+ *  (the same #680 scenario that wedges a prompt loop) the reader stays parked
+ *  in `query.next()` and never resolves. The orphaned reader exits safely on
+ *  its own (it re-checks `session !== initial` and the abort signal) if the
+ *  query ever yields, so teardown must not block on it indefinitely. */
+const READER_DONE_DRAIN_TIMEOUT_MS = 2000;
 
 /** Internal model-selection state. Mirrors the shape the ACP SDK exposed as
  *  `SessionModelState` before model selection moved entirely into
@@ -229,6 +250,25 @@ type Session = {
    *  NOT READ YET — recorded now so the mapping exists if/when we wire up
    *  fork/rewind. */
   messageIdToUuid: Map<string, string>;
+  /** Single-consumer queue fed by `#runSessionReader` while a prompt() turn
+   *  is active. prompt() drains it via `turnQueue.take()` instead of touching
+   *  the SDK iterator directly, so there is only ever one consumer of
+   *  `session.query.next()` (the reader). See issue #336. */
+  turnQueue: TurnQueue;
+  /** State machine for SDK messages the reader sees while no prompt() is
+   *  active. Lifecycle messages bypass it (emitted directly by the reader);
+   *  everything else accumulates as a followup-candidate until the closing
+   *  result/idle decides whether to forward or discard. */
+  offTurn: OffTurnFollowupCollector;
+  /** Resolves when `#runSessionReader` exits (abort, close, throw). Awaited
+   *  by `teardownSession` and the process-died recovery so the reader is
+   *  fully done before the session entry is deleted. */
+  readerDone: Promise<void>;
+  /** Ordered non-blocking side effects scheduled by the session reader
+   *  (raw SDK emits, lifecycle updates, autonomous followup forwarding).
+   *  The reader never awaits this chain, so a slow ACP client cannot stop
+   *  SDK consumption or block the next prompt from starting. */
+  readerSideEffects: Promise<void>;
 };
 
 /** Compute a stable fingerprint of the session-defining params so we can
@@ -899,11 +939,19 @@ export class ClaudeAcpAgent implements Agent {
       if (cancelled) {
         return { stopReason: "cancelled" };
       }
+      // We were queued behind a previous turn and have now been handed the
+      // stream. Re-assert promptRunning before consuming the turnQueue: in the
+      // normal handoff it is already true, but the finally-fallback below
+      // (the prior turn ended without replaying our message) resolves us
+      // *after* setting promptRunning=false. The reader keys off promptRunning
+      // to decide whether to route messages into the turnQueue we're about to
+      // read or off-turn — if it were left false our turn's messages would be
+      // misrouted to the off-turn collector and this prompt would hang. See #336.
+      session.promptRunning = true;
     } else {
       session.input.push(userMessage);
+      session.promptRunning = true;
     }
-
-    session.promptRunning = true;
     let handedOff = false;
     let errored = false;
     let stopReason: StopReason = "end_turn";
@@ -918,14 +966,21 @@ export class ClaudeAcpAgent implements Agent {
 
     try {
       while (true) {
-        const nextMessage = session.query.next();
-        const next = await Promise.race([nextMessage, cancelled]);
+        // Consume messages from the per-session reader, which is the sole
+        // consumer of session.query.next() (see #runSessionReader). The
+        // reader pushes only while promptRunning is true; off-turn messages
+        // are emitted as lifecycle or handled by the followup collector.
+        // See issue #336. The take() is raced against the force-cancel
+        // wake-up channel: when the SDK is wedged (e.g. a TaskOutput block,
+        // issue #680) the reader never pushes, so take() would hang forever —
+        // cancelController aborting lets the loop honor the cancel anyway.
+        const next = await Promise.race([session.turnQueue.take(), cancelled]);
         if (cancelController.signal.aborted) {
           // The SDK never yielded after interrupt() (e.g. a wedged TaskOutput
-          // block). Abandon the in-flight next() — swallowing any later
-          // rejection so it can't surface as an unhandled rejection — and
-          // honor the cancel per the ACP contract.
-          void nextMessage.catch(() => {});
+          // block) so the reader never pushed to the queue. Abandon the
+          // pending take() so the next prompt's take() doesn't trip the
+          // single-consumer guard, and honor the cancel per the ACP contract.
+          session.turnQueue.abandonTake();
           return { stopReason: "cancelled" };
         }
         const { value: message, done } = next as IteratorResult<SDKMessage, void>;
@@ -935,16 +990,6 @@ export class ClaudeAcpAgent implements Agent {
             return { stopReason: "cancelled" };
           }
           break;
-        }
-
-        if (
-          session.emitRawSDKMessages &&
-          shouldEmitRawMessage(session.emitRawSDKMessages, message)
-        ) {
-          await this.client.extNotification("_claude/sdkMessage", {
-            sessionId: params.sessionId,
-            message: message as Record<string, unknown>,
-          });
         }
 
         switch (message.type) {
@@ -1140,12 +1185,17 @@ export class ClaudeAcpAgent implements Agent {
                 });
                 break;
               }
+              case "task_started":
+              case "task_notification":
+                // Unreachable in practice: #runSessionReader intercepts
+                // task lifecycle for every turn state and emits it directly,
+                // so these never reach the turnQueue that prompt() consumes.
+                // Kept only for switch exhaustiveness. See #336.
+                break;
               case "hook_started":
               case "hook_progress":
               case "hook_response":
               case "files_persisted":
-              case "task_started":
-              case "task_notification":
               case "task_progress":
               case "task_updated":
                 break;
@@ -1634,51 +1684,66 @@ export class ClaudeAcpAgent implements Agent {
       throw new Error("Session did not end in result");
     } catch (error) {
       errored = true;
-      // A failed turn typically leaves a trailing `session_state_changed: idle`
-      // (and possibly more) in the query iterator. If we don't drain it here,
-      // the next prompt's first `query.next()` consumes that stale idle and
-      // short-circuits to end_turn with zero usage
-      // Bounded so a misbehaving SDK can't hang the next prompt indefinitely.
+      // A failed turn typically leaves trailing messages in the SDK iterator
+      // (a result with the error, a `session_state_changed: idle`). The
+      // session reader keeps consuming them and the off-turn collector
+      // discards anything that isn't a real task-notification followup, so
+      // we don't need to drain manually here. We do still need to interrupt
+      // the SDK so it stops producing.
       try {
         await session.query.interrupt();
-        const MAX_DRAIN = 100;
-        for (let i = 0; i < MAX_DRAIN; i++) {
-          const { value: m, done } = await session.query.next();
-          if (done || !m) break;
-          if (m.type === "system" && m.subtype === "session_state_changed" && m.state === "idle") {
-            break;
-          }
-          if (i === MAX_DRAIN - 1) {
-            this.logger.error(
-              `Session ${params.sessionId}: drained ${MAX_DRAIN} messages after error without observing idle`,
-            );
-          }
-        }
       } catch (drainErr) {
         this.logger.error(
-          `Session ${params.sessionId}: failed to drain query after prompt error:`,
+          `Session ${params.sessionId}: failed to interrupt query after prompt error:`,
           drainErr,
         );
+      }
+
+      // A force-cancel can win the race against an error: if cancel() aborted
+      // the wake-up channel (or teardown did), honor the cancel contract and
+      // return "cancelled" rather than surfacing the trailing error. Otherwise
+      // a cancel that coincides with an iterator throw would be misreported to
+      // the client as an internal error. See issues #680 and #336.
+      if (cancelController.signal.aborted || session.cancelled) {
+        return { stopReason: "cancelled" };
       }
 
       if (error instanceof RequestError || !(error instanceof Error)) {
         throw error;
       }
       const message = error.message;
-      if (
+      const processDied =
         message.includes("ProcessTransport") ||
         message.includes("terminated process") ||
         message.includes("process exited with") ||
         message.includes("process terminated by signal") ||
-        message.includes("Failed to write to process stdin")
-      ) {
-        this.logger.error(`Session ${params.sessionId}: Claude Agent process died: ${message}`);
+        message.includes("Failed to write to process stdin");
+      // The session reader is the sole consumer of the SDK iterator and is
+      // spawned exactly once. If its queue is in a terminal state the reader
+      // has exited (iterator threw or returned done) and will never feed this
+      // session again, so every future prompt() would fail the same way. Tear
+      // the session down so the client starts a fresh one instead of looping
+      // on a permanently bricked session. See #336.
+      const readerDead = session.turnQueue.isTerminal();
+      if (processDied || readerDead) {
+        this.logger.error(
+          processDied
+            ? `Session ${params.sessionId}: Claude Agent process died: ${message}`
+            : `Session ${params.sessionId}: session reader exited; tearing down session: ${message}`,
+        );
         session.settingsManager.dispose();
+        // Abort first so the reader exits its `query.next()` await cleanly,
+        // then wait for it to finish before deleting the entry. This avoids
+        // a leaked reader holding a reference to the disposed session.
+        session.abortController.abort();
         session.input.end();
+        await this.#drainReader(session);
         delete this.sessions[params.sessionId];
         throw RequestError.internalError(
           undefined,
-          "The Claude Agent process exited unexpectedly. Please start a new session.",
+          processDied
+            ? "The Claude Agent process exited unexpectedly. Please start a new session."
+            : "The Claude Agent session ended unexpectedly. Please start a new session.",
         );
       }
       throw error;
@@ -1695,11 +1760,20 @@ export class ClaudeAcpAgent implements Agent {
       }
       if (!handedOff) {
         session.promptRunning = false;
+        if (errored || session.cancelled) {
+          // The reader can run ahead of prompt() and queue messages for the
+          // active turn. If this prompt failed or was cancelled before
+          // consuming them, drop the leftovers so the next user prompt
+          // doesn't process stale/cancelled turn output. Done after
+          // promptRunning=false so the reader routes any further messages
+          // off-turn instead of back into the queue we just cleared.
+          session.turnQueue.clear();
+        }
         if (errored) {
-          // The query stream was just drained — handing pending prompts off
-          // onto it would let them race with the recovery. Cancel them so
-          // each waiting prompt() returns stopReason: "cancelled" and the
-          // client can decide whether to retry.
+          // The turn errored and we interrupted the query — handing pending
+          // prompts off onto the recovering stream would let them race with
+          // the recovery. Cancel them so each waiting prompt() returns
+          // stopReason: "cancelled" and the client can decide whether to retry.
           for (const pending of session.pendingMessages.values()) {
             pending.resolve(true);
           }
@@ -1718,6 +1792,355 @@ export class ClaudeAcpAgent implements Agent {
         }
       }
     }
+  }
+
+  /** Forward an SDK task lifecycle event (`task_started` /
+   *  `task_notification`) to the ACP client as a notification chunk. Called
+   *  both from inside prompt()'s loop (when a turn is active) and from
+   *  `#runSessionReader` (when no turn is running) so the client receives
+   *  these updates regardless of whether the user is mid-conversation. See
+   *  issue #336.
+   *
+   *  The current shape is intentionally minimal — text-mode `agent_message_chunk`
+   *  matches the sketch in the issue body and reaches every existing ACP
+   *  client. A future change could expose a dedicated `task_*` session-update
+   *  variant if the protocol gains one. */
+  async #emitTaskLifecycleUpdate(
+    sessionId: string,
+    message: SDKTaskStartedMessage | SDKTaskNotificationMessage,
+  ): Promise<void> {
+    if (message.skip_transcript) return;
+    const lines: string[] = [];
+    if (message.subtype === "task_started") {
+      const label = message.description ? `: ${message.description}` : "";
+      lines.push(`[task ${message.task_id}] started${label}`);
+    } else {
+      const label = message.summary ? `: ${message.summary}` : "";
+      lines.push(`[task ${message.task_id}] ${message.status}${label}`);
+      if (message.output_file) {
+        lines.push(`output: ${message.output_file}`);
+      }
+    }
+    try {
+      // Route to the reader's bound sessionId (the ACP session key), not
+      // message.session_id, which for subagent/task events can be a
+      // task-scoped id the client doesn't map. #emitFollowup does the same.
+      //
+      // Wrap the text in blank lines on both sides. Clients concatenate
+      // consecutive agent_message_chunks raw (chunk.text + chunk.text), so
+      // without a separator several lifecycle chunks that land back-to-back
+      // (e.g. two background tasks finishing together) and the agent text that
+      // follows fuse into one run. A single "\n" is not enough for markdown
+      // clients: with no hard-break extension a lone newline renders as a
+      // space, so only a blank line ("\n\n", a paragraph break) actually
+      // separates the lines visually. Both sides are needed — the leading pair
+      // detaches from preceding text, the trailing pair from following text.
+      await this.client.sessionUpdate({
+        sessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: `\n\n${lines.join("\n")}\n\n` },
+        },
+      });
+    } catch (err) {
+      this.logger.error(`Session ${sessionId}: failed to forward task lifecycle update:`, err);
+    }
+  }
+
+  /** Forward an autonomous task-notification followup (assistant chunks +
+   *  result) to the client out-of-turn. Called by the off-turn collector
+   *  when a `result` with `origin.kind === 'task-notification'` closes a
+   *  buffered group. We render the followup using the same notification
+   *  helpers prompt() uses for in-turn messages, so the client sees a
+   *  consistent stream, but we never touch session.accumulatedUsage,
+   *  stopReason, or pending prompts — this is independent of any user turn.
+   *  See issue #336. */
+  async #emitFollowup(
+    sessionId: string,
+    buffered: SDKMessage[],
+    result: SDKResultMessage,
+  ): Promise<void> {
+    const session = this.sessions[sessionId];
+    if (!session) return;
+    const isCurrentSession = (): boolean => this.sessions[sessionId] === session;
+
+    // A followup is a self-contained group; its tool_use/tool_result pairs are
+    // internal to the group. Use a local cache (like replaySessionHistory)
+    // rather than session.toolUseCache: the followup runs detached on the
+    // reader's side-effect chain and can overlap a live prompt() turn that is
+    // concurrently mutating session.toolUseCache, so sharing it would corrupt
+    // the live turn's tool-call rendering. See issue #336.
+    const toolUseCache: ToolUseCache = {};
+
+    // Track which top-level message ids actually streamed text/thinking via
+    // stream_event deltas, so the assembled `assistant` block is dropped as a
+    // duplicate when it streamed and forwarded as a fallback when it did not.
+    // Mirrors the in-turn handler in prompt() so a followup behind a
+    // non-streaming gateway (e.g. an OpenAI-compatible proxy that returns the
+    // turn as one un-streamed block) still delivers its final answer. See #757.
+    // The delta events don't carry the API message id, so it is captured from
+    // the preceding `message_start` (the same id messageIdForGrouping returns
+    // for the consolidated assistant message), keyed identically so they match.
+    let currentStreamMessageId: string | undefined;
+    const streamedTextIds = new Set<string>();
+    const streamedThinkingIds = new Set<string>();
+
+    for (const message of buffered) {
+      if (!isCurrentSession()) return;
+      try {
+        if (message.type === "stream_event") {
+          if (message.event.type === "message_start") {
+            currentStreamMessageId = message.event.message.id || undefined;
+          }
+          if (
+            currentStreamMessageId &&
+            message.parent_tool_use_id === null &&
+            message.event.type === "content_block_delta"
+          ) {
+            if (message.event.delta.type === "text_delta") {
+              streamedTextIds.add(currentStreamMessageId);
+            } else if (message.event.delta.type === "thinking_delta") {
+              streamedThinkingIds.add(currentStreamMessageId);
+            }
+          }
+          for (const notification of streamEventToAcpNotifications(
+            message as SDKPartialAssistantMessage,
+            sessionId,
+            toolUseCache,
+            this.client,
+            this.logger,
+            {
+              clientCapabilities: this.clientCapabilities,
+              cwd: session.cwd,
+              taskState: session.taskState,
+            },
+          )) {
+            if (!isCurrentSession()) return;
+            await this.client.sessionUpdate(notification);
+          }
+          continue;
+        }
+        if (message.type === "user" || message.type === "assistant") {
+          // The SDK widened message.message.role to include "system"; those
+          // carry no client-renderable content here, and toAcpNotifications
+          // only accepts "user" | "assistant". Skip them, mirroring the
+          // in-turn handler in prompt().
+          if (message.message.role === "system") continue;
+          let content: typeof message.message.content;
+          if (message.type === "assistant" && message.parent_tool_use_id === null) {
+            // Top-level assistant message: drop text/thinking blocks already
+            // streamed live as chunks, forward (as a fallback) any that were
+            // not, so non-streaming gateways still deliver the followup's
+            // answer. Mirrors prompt()'s in-turn filter. See #757.
+            const id = messageIdForGrouping(message);
+            content = message.message.content.filter((item) => {
+              if (item.type !== "text" && item.type !== "thinking") {
+                return true;
+              }
+              const streamedLive =
+                id !== undefined &&
+                (item.type === "text" ? streamedTextIds : streamedThinkingIds).has(id);
+              if (streamedLive) {
+                return false;
+              }
+              const text = item.type === "text" ? item.text : item.thinking;
+              return text.length > 0;
+            });
+          } else if (message.type === "assistant") {
+            // Subagent assistant message: never streamed live and internal to
+            // the tool call, so keep dropping its text/thinking.
+            content = message.message.content.filter(
+              (item) => item.type !== "text" && item.type !== "thinking",
+            );
+          } else {
+            content = message.message.content;
+          }
+          for (const notification of toAcpNotifications(
+            content,
+            message.message.role,
+            sessionId,
+            toolUseCache,
+            this.client,
+            this.logger,
+            {
+              clientCapabilities: this.clientCapabilities,
+              parentToolUseId: message.parent_tool_use_id,
+              cwd: session.cwd,
+              taskState: session.taskState,
+            },
+          )) {
+            if (!isCurrentSession()) return;
+            await this.client.sessionUpdate(notification);
+          }
+        }
+      } catch (err) {
+        this.logger.error(`Session ${sessionId}: failed to forward followup message:`, err);
+      }
+    }
+
+    const followupUsage = computeFollowupUsageUpdate(buffered, result, session.contextWindowSize);
+    try {
+      if (!isCurrentSession()) return;
+      await this.client.sessionUpdate({
+        sessionId,
+        update: {
+          sessionUpdate: "usage_update",
+          used: followupUsage.used,
+          size: followupUsage.size,
+          cost: {
+            amount: result.total_cost_usd,
+            currency: "USD",
+          },
+          ...(result.origin && {
+            _meta: { "_claude/origin": result.origin },
+          }),
+        },
+      });
+    } catch (err) {
+      this.logger.error(`Session ${sessionId}: failed to emit followup usage_update:`, err);
+    }
+  }
+
+  #enqueueReaderSideEffect(sessionId: string, effect: () => Promise<void>): void {
+    const session = this.sessions[sessionId];
+    if (!session) return;
+    session.readerSideEffects = session.readerSideEffects
+      .then(async () => {
+        if (this.sessions[sessionId] !== session) return;
+        await effect();
+      })
+      .catch((err) => {
+        this.logger.error(`Session ${sessionId}: session reader side effect failed:`, err);
+      });
+  }
+
+  /** Per-session reader. Sole consumer of `session.query.next()`. Lifecycle
+   *  messages are forwarded to the client immediately. In-turn messages
+   *  (while prompt() is running) are pushed onto the session's `turnQueue`.
+   *  Off-turn messages are fed to the `offTurn` collector, which decides
+   *  whether to forward them as an autonomous followup or discard them.
+   *  Exits on abort, iterator close, or iterator throw; in all cases the
+   *  `turnQueue` is closed/errored so any consumer is unblocked, and the
+   *  caller's `resolveDone()` is invoked. See issue #336. */
+  async #runSessionReader(sessionId: string, resolveDone: () => void): Promise<void> {
+    const initial = this.sessions[sessionId];
+    if (!initial) {
+      resolveDone();
+      return;
+    }
+    try {
+      while (true) {
+        const session = this.sessions[sessionId];
+        // Session was deleted or replaced under us — stop reading from a
+        // stale iterator. The finally below closes turnQueue / resets
+        // offTurn so no consumer is left hanging.
+        if (!session || session !== initial) return;
+        if (initial.abortController.signal.aborted) return;
+
+        let res: IteratorResult<SDKMessage, void>;
+        try {
+          res = await session.query.next();
+        } catch (err) {
+          // Iterator threw — propagate to the active consumer (if any) so
+          // prompt() surfaces the error to the caller, and exit. The
+          // process-died recovery in prompt() handles map cleanup.
+          if (initial.abortController.signal.aborted) {
+            // Abort during teardown is expected; don't noise the log.
+            session.turnQueue.close();
+          } else {
+            this.logger.error(`Session ${sessionId}: session reader stopped:`, err);
+            session.turnQueue.error(err);
+          }
+          session.offTurn.reset();
+          return;
+        }
+        if (res.done) {
+          session.turnQueue.close();
+          session.offTurn.reset();
+          return;
+        }
+        const message = res.value;
+        if (!message) continue;
+
+        // Raw SDK emit is unified here so clients with emitRawSDKMessages
+        // see every message regardless of whether a turn is active.
+        //
+        // Ordering contract: raw `_claude/sdkMessage` notifications are a
+        // standalone telemetry channel. They are FIFO-ordered among
+        // themselves (the readerSideEffects chain is a strict promise
+        // sequence), but they are NOT ordered relative to the derived
+        // session/update stream that prompt() emits inline — the reader
+        // does not block on the client, so a message's parsed update can
+        // reach the client before its raw form. Clients must not assume
+        // raw precedes the derived update for a given message.
+        if (
+          session.emitRawSDKMessages &&
+          shouldEmitRawMessage(session.emitRawSDKMessages, message)
+        ) {
+          this.#enqueueReaderSideEffect(sessionId, async () => {
+            try {
+              await this.client.extNotification("_claude/sdkMessage", {
+                sessionId,
+                message: message as Record<string, unknown>,
+              });
+            } catch (err) {
+              this.logger.error(`Session ${sessionId}: raw SDK emit failed:`, err);
+            }
+          });
+        }
+
+        // Lifecycle is forwarded immediately, regardless of turn state.
+        // classifyOffTurn is the single source of truth for which subtypes are
+        // lifecycle vs followup-candidate (see session-reader.ts); the narrowed
+        // type lets #emitTaskLifecycleUpdate accept it directly.
+        if (classifyOffTurn(message) === "lifecycle") {
+          this.#enqueueReaderSideEffect(sessionId, () =>
+            this.#emitTaskLifecycleUpdate(
+              sessionId,
+              message as SDKTaskStartedMessage | SDKTaskNotificationMessage,
+            ),
+          );
+          continue;
+        }
+
+        // In-turn: hand off to prompt() via the queue. The reader checks
+        // promptRunning *after* obtaining the message, so a turn that just
+        // started gets the message; a turn that just ended sees nothing
+        // (the off-turn collector handles those instead).
+        if (session.promptRunning) {
+          session.turnQueue.push(message);
+          continue;
+        }
+
+        // Off-turn: feed the followup state machine.
+        await session.offTurn.accept(message);
+      }
+    } finally {
+      // Final cleanup: every exit path lands here. close() and reset() are
+      // idempotent, so the inner branches that already called them stay
+      // correct, and any future early-return we add gets safe defaults.
+      initial.turnQueue.close();
+      initial.offTurn.reset();
+      resolveDone();
+    }
+  }
+
+  /** Test-only hook so unit tests can drive the session reader without
+   *  going through `newSession`'s heavyweight init (SDK CLI spawn, settings
+   *  load). Not part of the public API. */
+  startSessionReaderForTest(sessionId: string, resolveDone?: () => void): Promise<void> {
+    return this.#runSessionReader(sessionId, resolveDone ?? (() => {}));
+  }
+
+  /** Test-only hook so unit tests can exercise the real followup-forwarding
+   *  path (#emitFollowup) end-to-end without reaching into a private field.
+   *  Not part of the public API. */
+  emitFollowupForTest(
+    sessionId: string,
+    buffered: SDKMessage[],
+    result: SDKResultMessage,
+  ): Promise<void> {
+    return this.#emitFollowup(sessionId, buffered, result);
   }
 
   async cancel(params: CancelNotification): Promise<void> {
@@ -1760,6 +2183,19 @@ export class ClaudeAcpAgent implements Agent {
     await session.query.interrupt();
   }
 
+  /** Wait (bounded) for a session's reader to exit, then drain its detached
+   *  side-effect chain. A wedged SDK iterator (issue #680) can leave the reader
+   *  parked in query.next() forever, so neither wait can be unbounded — the
+   *  orphaned reader exits on its own once the query yields (it re-checks
+   *  `session !== initial`). Draining readerSideEffects after readerDone lets
+   *  queued lifecycle/raw/followup emits finish before the session entry is
+   *  deleted, so a late sessionUpdate can't land for a closed session. See
+   *  issue #336. */
+  async #drainReader(session: Session): Promise<void> {
+    await settleWithin(session.readerDone, READER_DONE_DRAIN_TIMEOUT_MS);
+    await settleWithin(session.readerSideEffects, READER_SIDE_EFFECT_DRAIN_TIMEOUT_MS);
+  }
+
   /** Cleanly tear down a session: cancel in-flight work, dispose resources,
    *  and remove it from the session map. */
   private async teardownSession(sessionId: string): Promise<void> {
@@ -1783,6 +2219,10 @@ export class ClaudeAcpAgent implements Agent {
     session.settingsManager.dispose();
     session.abortController.abort();
     session.query.close();
+    // Wait for the session reader to exit and its side effects to drain before
+    // deleting the entry, so an in-flight read completes deterministically and
+    // no late sessionUpdate lands for a closed session.
+    await this.#drainReader(session);
     delete this.sessions[sessionId];
   }
 
@@ -2792,7 +3232,29 @@ export class ClaudeAcpAgent implements Agent {
       taskState,
       toolUseCache: {},
       messageIdToUuid: new Map(),
+      turnQueue: new TurnQueue(),
+      offTurn: new OffTurnFollowupCollector(
+        sessionId,
+        async (msgs, result) => {
+          this.#enqueueReaderSideEffect(sessionId, () =>
+            this.#emitFollowup(sessionId, msgs, result),
+          );
+        },
+        this.logger,
+      ),
+      readerDone: Promise.resolve(),
+      readerSideEffects: Promise.resolve(),
     };
+    // Spawn the session reader so task_started / task_notification events
+    // delivered between turns reach the ACP client (#336).
+    let resolveReaderDone!: () => void;
+    this.sessions[sessionId].readerDone = new Promise<void>((resolve) => {
+      resolveReaderDone = resolve;
+    });
+    void this.#runSessionReader(sessionId, resolveReaderDone).catch((err) => {
+      this.logger.error(`Session ${sessionId}: session reader crashed:`, err);
+      resolveReaderDone();
+    });
 
     return {
       sessionId,
@@ -2841,6 +3303,93 @@ function totalTokens(usage: UsageSnapshot): number {
     usage.cache_read_input_tokens +
     usage.cache_creation_input_tokens
   );
+}
+
+/** Await `p` but give up after `ms`. Always resolves (never rejects), so it
+ *  is safe to use in teardown paths where we want best-effort draining
+ *  without risking a hang on a wedged downstream. */
+async function settleWithin(p: Promise<unknown>, ms: number): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, ms);
+  });
+  try {
+    await Promise.race([
+      p.then(
+        () => {},
+        () => {},
+      ),
+      timeout,
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/** Derive the `used`/`size` for an autonomous followup's usage_update from
+ *  its buffered messages, mirroring prompt()'s in-turn usage tracking.
+ *
+ *  Deliberate scope/semantics (so the followup never corrupts user-turn state):
+ *  - Only top-level (`parent_tool_use_id === null`) messages update the usage
+ *    snapshot, matching the in-turn logic — subagent token spend doesn't count
+ *    toward the main thread's context occupancy.
+ *  - If the followup is entirely subagent work (no top-level message), there is
+ *    no main-thread snapshot, so we fall back to `result.usage` as a coarse
+ *    proxy. It may overstate main-thread occupancy, but it's the only
+ *    aggregate available and it's strictly informational for a background task.
+ *  - We never write the learned context window back to the session: a followup
+ *    runs out-of-turn and must not mutate `session.contextWindowSize`, which
+ *    belongs to the user's turns. `fallbackContextWindow` is read-only here. */
+export function computeFollowupUsageUpdate(
+  buffered: SDKMessage[],
+  result: SDKResultMessage,
+  fallbackContextWindow: number,
+): { used: number; size: number } {
+  let lastUsage: UsageSnapshot | null = null;
+  let lastModel: string | null = null;
+
+  for (const message of buffered) {
+    if (message.type === "stream_event" && message.parent_tool_use_id === null) {
+      if (message.event.type === "message_start") {
+        lastUsage = snapshotFromUsage(message.event.message.usage);
+        const model = message.event.message.model;
+        if (model && model !== "<synthetic>") {
+          lastModel = model;
+        }
+      } else if (message.event.type === "message_delta") {
+        const usage = message.event.usage;
+        const prev: Readonly<UsageSnapshot> = lastUsage ?? ZERO_USAGE;
+        // Per Anthropic API, message_delta usage is cumulative; the nullable
+        // fields fall back to the prior snapshot when omitted. output_tokens
+        // is guaranteed non-null, so it is not coalesced — same treatment as
+        // the in-turn handler.
+        lastUsage = {
+          input_tokens: usage.input_tokens ?? prev.input_tokens,
+          output_tokens: usage.output_tokens,
+          cache_read_input_tokens: usage.cache_read_input_tokens ?? prev.cache_read_input_tokens,
+          cache_creation_input_tokens:
+            usage.cache_creation_input_tokens ?? prev.cache_creation_input_tokens,
+        };
+      }
+      continue;
+    }
+
+    if (message.type === "assistant" && message.parent_tool_use_id === null) {
+      lastUsage = snapshotFromUsage(message.message.usage);
+      const model = message.message.model;
+      if (model && model !== "<synthetic>") {
+        lastModel = model;
+      }
+    }
+  }
+
+  const matchingModelUsage = lastModel ? getMatchingModelUsage(result.modelUsage, lastModel) : null;
+  const inferredContextWindow = lastModel ? inferContextWindowFromModel(lastModel) : null;
+
+  return {
+    used: totalTokens(lastUsage ?? snapshotFromUsage(result.usage)),
+    size: matchingModelUsage?.contextWindow ?? inferredContextWindow ?? fallbackContextWindow,
+  };
 }
 
 /**

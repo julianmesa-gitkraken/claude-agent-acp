@@ -47,6 +47,11 @@ describe("ClaudeAcpAgent settings", () => {
         }),
         setModel: setModelSpy,
         supportedCommands: async () => [],
+        // Iterator stub for the session reader: returns a pending promise so
+        // the reader parks until the session is torn down. Tests that don't
+        // exercise prompt() never observe a message.
+        next: () => new Promise(() => {}),
+        close: () => {},
       } as any;
     });
     return { getCapturedOptions: () => capturedOptions, setModelSpy };
@@ -246,6 +251,11 @@ describe("ClaudeAcpAgent settings", () => {
           setModel: setModelSpy,
           setPermissionMode: setPermissionModeSpy,
           supportedCommands: async () => [],
+          // Iterator stub for the session reader: returns a pending promise so
+          // the reader parks until the session is torn down. Tests that don't
+          // exercise prompt() never observe a message.
+          next: () => new Promise(() => {}),
+          close: () => {},
         } as any;
       });
       return {
@@ -401,6 +411,11 @@ describe("ClaudeAcpAgent settings", () => {
           initializationResult: async () => ({ models }),
           setModel: setModelSpy,
           supportedCommands: async () => [],
+          // Iterator stub for the session reader: returns a pending promise so
+          // the reader parks until the session is torn down. Tests that don't
+          // exercise prompt() never observe a message.
+          next: () => new Promise(() => {}),
+          close: () => {},
         } as any;
       });
       return { setModelSpy };
@@ -732,6 +747,11 @@ describe("ClaudeAcpAgent settings", () => {
         }),
         setModel: setModelSpy,
         supportedCommands: async () => [],
+        // Iterator stub for the session reader: returns a pending promise so
+        // the reader parks until the session is torn down. Tests that don't
+        // exercise prompt() never observe a message.
+        next: () => new Promise(() => {}),
+        close: () => {},
       } as any;
     });
 
@@ -773,6 +793,11 @@ describe("ClaudeAcpAgent settings", () => {
         }),
         setModel: setModelSpy,
         supportedCommands: async () => [],
+        // Iterator stub for the session reader: returns a pending promise so
+        // the reader parks until the session is torn down. Tests that don't
+        // exercise prompt() never observe a message.
+        next: () => new Promise(() => {}),
+        close: () => {},
       } as any;
     });
 
@@ -826,6 +851,11 @@ describe("ClaudeAcpAgent settings", () => {
         }),
         setModel: setModelSpy,
         supportedCommands: async () => [],
+        // Iterator stub for the session reader: returns a pending promise so
+        // the reader parks until the session is torn down. Tests that don't
+        // exercise prompt() never observe a message.
+        next: () => new Promise(() => {}),
+        close: () => {},
       } as any;
     });
 
