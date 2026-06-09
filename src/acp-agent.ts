@@ -191,6 +191,11 @@ type Session = {
   query: Query;
   input: Pushable<SDKUserMessage>;
   cancelled: boolean;
+  /** True after a client interrupt while a turn is active. Unlike
+   *  `cancelled`, this survives a queued follow-up prompt's entry reset so the
+   *  interrupted turn's late terminal error can still be treated as a benign
+   *  cancellation. Cleared when the interrupted turn ends. */
+  interrupted: boolean;
   cwd: string;
   /** Serialized snapshot of session-defining params (cwd, mcpServers) used to
    *  detect when loadSession/resumeSession is called with changed values. */
@@ -1296,6 +1301,17 @@ export class ClaudeAcpAgent implements Agent {
               break;
             }
 
+            // Interrupt & send: a queued follow-up prompt resets
+            // `session.cancelled` when it enters prompt(), but the interrupted
+            // turn can still later yield its terminal is_error result. Treat
+            // that result as the cancelled turn winding down instead of
+            // failing the session and cancelling the queued prompt.
+            if (session.interrupted && message.is_error && !isTaskNotification) {
+              session.interrupted = false;
+              stopReason = "cancelled";
+              break;
+            }
+
             switch (message.subtype) {
               case "success": {
                 if (message.result.includes("Please run /login")) {
@@ -1758,6 +1774,7 @@ export class ClaudeAcpAgent implements Agent {
       if (session.cancelController === cancelController) {
         session.cancelController = undefined;
       }
+      session.interrupted = false;
       if (!handedOff) {
         session.promptRunning = false;
         if (errored || session.cancelled) {
@@ -2149,6 +2166,9 @@ export class ClaudeAcpAgent implements Agent {
       return;
     }
     session.cancelled = true;
+    if (session.promptRunning || session.cancelController) {
+      session.interrupted = true;
+    }
     for (const [, pending] of session.pendingMessages) {
       pending.resolve(true);
     }
@@ -3209,6 +3229,7 @@ export class ClaudeAcpAgent implements Agent {
       query: q,
       input: input,
       cancelled: false,
+      interrupted: false,
       cwd: params.cwd,
       sessionFingerprint: computeSessionFingerprint(params),
       settingsManager,

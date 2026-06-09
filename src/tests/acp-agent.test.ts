@@ -1701,6 +1701,7 @@ describe("stop reason propagation", () => {
       query: messageGenerator() as any,
       input,
       cancelled: false,
+      interrupted: false,
       cwd: "/test",
       sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
       modes: {
@@ -1857,6 +1858,7 @@ describe("stop reason propagation", () => {
       cwd: "/tmp/test",
       sessionFingerprint: JSON.stringify({ cwd: "/tmp/test", mcpServers: [] }),
       cancelled: false,
+      interrupted: false,
       modes: {
         currentModeId: "default",
         availableModes: [],
@@ -2024,6 +2026,7 @@ describe("session/close", () => {
       query: gen as any,
       input: new Pushable(),
       cancelled: false,
+      interrupted: false,
       cwd: "/test",
       sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
       modes: {
@@ -2124,6 +2127,7 @@ describe("session/delete", () => {
       query: gen as any,
       input: new Pushable(),
       cancelled: false,
+      interrupted: false,
       cwd: "/test",
       sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
       modes: { currentModeId: "default", availableModes: [] },
@@ -2232,6 +2236,7 @@ describe("getOrCreateSession param change detection", () => {
       query: gen as any,
       input: new Pushable(),
       cancelled: false,
+      interrupted: false,
       cwd,
       sessionFingerprint: JSON.stringify({
         cwd,
@@ -2605,6 +2610,7 @@ describe("usage_update computation", () => {
       query: messageGenerator() as any,
       input,
       cancelled: false,
+      interrupted: false,
       cwd: "/test",
       sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
       modes: {
@@ -3628,6 +3634,7 @@ describe("assembled assistant text fallback", () => {
       query: messageGenerator() as any,
       input,
       cancelled: false,
+      interrupted: false,
       cwd: "/test",
       sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
       modes: { currentModeId: "default", availableModes: [] },
@@ -3832,6 +3839,7 @@ describe("emitRawSDKMessages", () => {
       query: messageGenerator() as any,
       input,
       cancelled: false,
+      interrupted: false,
       cwd: "/test",
       sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
       modes: { currentModeId: "default", availableModes: [] },
@@ -4070,6 +4078,7 @@ describe("result origin handling", () => {
       query: messageGenerator() as any,
       input,
       cancelled: false,
+      interrupted: false,
       cwd: "/test",
       sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
       modes: { currentModeId: "default", availableModes: [] },
@@ -4255,6 +4264,7 @@ describe("memory_recall handling", () => {
       query: messageGenerator() as any,
       input,
       cancelled: false,
+      interrupted: false,
       cwd: "/test",
       sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
       modes: { currentModeId: "default", availableModes: [] },
@@ -4495,6 +4505,7 @@ describe("post-error recovery", () => {
       query: gen as any,
       input,
       cancelled: false,
+      interrupted: false,
       cwd: "/test",
       sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
       modes: { currentModeId: "default", availableModes: [] },
@@ -4650,6 +4661,7 @@ describe("session/cancel wedge recovery (issue #680)", () => {
       query: gen as any,
       input,
       cancelled: false,
+      interrupted: false,
       cwd: "/test",
       sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
       modes: { currentModeId: "default", availableModes: [] },
@@ -5121,6 +5133,7 @@ describe("session reader (issue #336)", () => {
       query: query as any,
       input,
       cancelled: false,
+      interrupted: false,
       cwd: "/test",
       sessionFingerprint: JSON.stringify({ cwd: "/test", mcpServers: [] }),
       settingsManager: { dispose: vi.fn() } as any,
@@ -6324,6 +6337,107 @@ describe("session reader (issue #336)", () => {
     for (const u of usageUpdates) {
       expect(u.update.used).not.toBe(9999 * 2);
     }
+
+    agent.sessions["s1"]!.abortController.abort();
+    query.close();
+  });
+
+  it("treats an interrupted turn's late is_error result as cancelled after a queued prompt resets cancelled", async () => {
+    // Interrupt & send races like this:
+    // 1. prompt A is running
+    // 2. cancel() marks the session cancelled
+    // 3. prompt B enters while A is still winding down and resets `cancelled`
+    // 4. A's terminal is_error result finally arrives
+    //
+    // Without the separate `interrupted` flag, step 4 throws an Internal error
+    // and cancels B out of pendingMessages.
+    const { client } = createCaptureClient();
+    const agent = createAgent(client);
+    const query = new QueryStub();
+    const input = new Pushable<any>();
+    const session = buildSession("s1", agent, query, input);
+
+    const result = (overrides: Partial<Record<string, unknown>> = {}) => ({
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      result: "ok",
+      stop_reason: "end_turn",
+      num_turns: 1,
+      duration_ms: 1,
+      duration_api_ms: 1,
+      total_cost_usd: 0,
+      usage: {
+        input_tokens: 1,
+        output_tokens: 1,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+      },
+      modelUsage: {},
+      permission_denials: [],
+      uuid: "u-result",
+      session_id: "s1",
+      ...overrides,
+    });
+    const idle = (uuid: string) => ({
+      type: "system",
+      subtype: "session_state_changed",
+      state: "idle",
+      uuid,
+      session_id: "s1",
+    });
+
+    const promptA = agent.prompt({
+      sessionId: "s1",
+      prompt: [{ type: "text", text: "first" }],
+    });
+    await vi.waitFor(() => expect(session.promptRunning).toBe(true));
+    query.push({
+      type: "user",
+      message: { role: "user", content: "first" },
+      parent_tool_use_id: null,
+      isReplay: true,
+      uuid: "u-a",
+      session_id: "s1",
+    });
+
+    await agent.cancel({ sessionId: "s1" });
+    expect(session.cancelled).toBe(true);
+    expect(session.interrupted).toBe(true);
+
+    const promptB = agent.prompt({
+      sessionId: "s1",
+      prompt: [{ type: "text", text: "second" }],
+    });
+    await vi.waitFor(() => expect(session.pendingMessages.size).toBe(1));
+    expect(session.cancelled).toBe(false);
+    expect(session.interrupted).toBe(true);
+
+    query.push(
+      result({
+        is_error: true,
+        result: "[ede_diagnostic] result_type=user stop_reason=tool_use",
+        stop_reason: "tool_use",
+        uuid: "u-a-error",
+      }),
+    );
+    await vi.waitFor(() => expect(session.interrupted).toBe(false));
+
+    const [queuedUuid] = session.pendingMessages.keys();
+    query.push({
+      type: "user",
+      message: { role: "user", content: "second" },
+      parent_tool_use_id: null,
+      isReplay: true,
+      uuid: queuedUuid,
+      session_id: "s1",
+    });
+    await expect(promptA).resolves.toMatchObject({ stopReason: "end_turn" });
+
+    query.push(result({ uuid: "u-b-result" }));
+    query.push(idle("u-b-idle"));
+    await expect(promptB).resolves.toMatchObject({ stopReason: "end_turn" });
+    expect(session.pendingMessages.size).toBe(0);
 
     agent.sessions["s1"]!.abortController.abort();
     query.close();
